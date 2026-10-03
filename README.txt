@@ -30,6 +30,7 @@
 - 本專案以 MIT 授權釋出，詳見 LICENSE。
 
 【第三方函式庫】
+本程式使用下列開源函式庫，各自適用其授權條款，詳見 THIRD_PARTY_NOTICES.txt：
 本程式使用下列開源函式庫，各自適用其授權條款：
 - libnx (ISC)
 - SDL2、SDL2_ttf (zlib)
