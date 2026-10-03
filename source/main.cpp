@@ -79,13 +79,14 @@ static void saveCfg() {
 }
 
 // ---------- 軟體鍵盤 ----------
-static bool kbd(const char* header, string& val) {
+static bool kbd(const char* header, string& val, bool pw = false) {
     SwkbdConfig k;
     if (R_FAILED(swkbdCreate(&k, 0))) return false;
     swkbdConfigMakePresetDefault(&k);
     swkbdConfigSetHeaderText(&k, header);
     swkbdConfigSetInitialText(&k, val.c_str());
     swkbdConfigSetStringLenMax(&k, 200);
+    if (pw) swkbdConfigSetPasswordFlag(&k, true);   // 輸入時顯示 ****
     char out[1024] = {0};
     Result rc = swkbdShow(&k, out, sizeof out);
     swkbdClose(&k);
@@ -658,7 +659,7 @@ static void mainScreen() {
         else if (i == 3) { if (kbd("使用者名稱 (建議英文或數字)", cfg.name)) { cfg.name = cleanName(cfg.name); saveCfg(); } }
         else if (i == 4) { if (kbd("WebDAV 位址 (例 https://dav.example.com/ns/)", cfg.url)) saveCfg(); }
         else if (i == 5) { if (kbd("帳號", cfg.user)) saveCfg(); }
-        else if (i == 6) { if (kbd("密碼", cfg.pass)) saveCfg(); }
+        else if (i == 6) { if (kbd("密碼", cfg.pass, true)) saveCfg(); }
         else if (i >= 8 && i < 8 + n) {
             int k = i - 8;
             if (confirm("移除這個共享資料夾?\n" + cfg.dirs[k], "確定移除")) { cfg.dirs.erase(cfg.dirs.begin() + k); saveCfg(); sel = i - 1; }
