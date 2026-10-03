@@ -26,7 +26,7 @@ $(TARGET).elf: source/main.cpp
 	$(PREFIX)g++ $(CXXFLAGS) $< -o $@ $(LDFLAGS) $(LIBS)
 
 $(TARGET).nacp:
-	$(TOOLS)/nacptool --create "Save WebDAV" "ted5789" "1.1.0" $@
+	$(TOOLS)/nacptool --create "Save WebDAV" "ted5789" "1.0.0" $@
 
 $(TARGET).nro: $(TARGET).elf $(TARGET).nacp icon.jpg
 	$(TOOLS)/elf2nro $(TARGET).elf $@ --nacp=$(TARGET).nacp --icon=icon.jpg
