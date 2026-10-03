@@ -283,6 +283,19 @@ static bool packAll() {
     if (archive_write_open_filename(a, TMP_FILE) != ARCHIVE_OK) {
         logf_("無法建立暫存檔\n"); archive_write_free(a); return false;
     }
+    {   // 把「共享資料夾清單」一起放進 7z，還原時自動加入
+        string man;
+        for (auto& d0 : cfg.dirs) man += normDir(d0) + "\n";
+        struct archive_entry* me = archive_entry_new();
+        archive_entry_set_pathname(me, "Save_WebDAV_folders.txt");
+        archive_entry_set_size(me, man.size());
+        archive_entry_set_filetype(me, AE_IFREG);
+        archive_entry_set_perm(me, 0644);
+        archive_entry_set_mtime(me, time(NULL), 0);
+        if (archive_write_header(a, me) < ARCHIVE_WARN) packErr = archive_error_string(a) ? archive_error_string(a) : "manifest";
+        else archive_write_data(a, man.data(), man.size());
+        archive_entry_free(me);
+    }
     packedCount = 0;
     for (size_t i = 0; i < cfg.dirs.size(); i++) {
         string d = normDir(cfg.dirs[i]);
@@ -328,6 +341,21 @@ static bool unpackAll(const char* file) {
     while (archive_read_next_header(a, &e) == ARCHIVE_OK) {
         string name = archive_entry_pathname(e);
         if (!safeName(name)) { logf_("\n略過不安全路徑: %s\n", name.c_str()); continue; }
+        if (name == "Save_WebDAV_folders.txt") {   // 清單檔: 不寫到 SD 卡，直接加入共享資料夾
+            string content; ssize_t r2;
+            while ((r2 = archive_read_data(a, ioBuf.data(), ioBuf.size())) > 0) content.append(ioBuf.data(), r2);
+            size_t i2 = 0; int added = 0;
+            while (i2 < content.size()) {
+                size_t e2 = content.find('\n', i2); if (e2 == string::npos) e2 = content.size();
+                string ln = content.substr(i2, e2 - i2); i2 = e2 + 1;
+                while (!ln.empty() && ln.back() == '\r') ln.pop_back();
+                if (ln.empty()) continue;
+                ln = normDir(ln);
+                if (cfg.dirs.size() < 20 && find(cfg.dirs.begin(), cfg.dirs.end(), ln) == cfg.dirs.end()) { cfg.dirs.push_back(ln); added++; }
+            }
+            if (added) { saveCfg(); logf_("已自動加入 %d 個共享資料夾", added); }
+            continue;
+        }
         string target = "sdmc:/" + name;
         if (archive_entry_filetype(e) == AE_IFDIR) { mkdirs(target + "/"); mkdir(target.c_str(), 0777); continue; }
         mkdirs(target);
@@ -758,42 +786,149 @@ static string baseName(const string& p) {
     return (i == string::npos || i + 1 >= p.size()) ? p : p.substr(i + 1);
 }
 
+// ---------- 主畫面: 一頁雙欄 (左: 功能+設定 / 右: 共享資料夾) ----------
+static void drawRowAt(const Row& r, int x, int y, int w, bool s) {
+    if (r.kind == 3) { txt(r.a, 20, x + 12, y + 6, C_GRAY, 0, w - 24); return; }
+    if (s) rect(x - 3, y - 3, w + 6, r.h + 6, C_ACC);
+    Col bg = r.kind == 1 ? (s ? C_ACC : C_BTN) : (s ? C_SEL : C_CARD);
+    rect(x, y, w, r.h, bg);
+    if (r.kind == 1) txt(r.a, 32, x + w / 2, y + (r.h - 44) / 2, s ? C_DARK : C_WHITE, 1, w - 20);
+    else if (r.kind == 5) {   // 資料夾: 名稱在上，位置在下，都靠左
+        txt(r.a, 28, x + 20, y + 8, C_WHITE, 0, w - 40);
+        txt(r.b, 20, x + 20, y + r.h - 32, s ? C_WHITE : C_GRAY, 0, w - 40);
+    } else {
+        txt(r.a, 26, x + 20, y + (r.h - 36) / 2, C_WHITE, 0, w * 40 / 100);
+        txt(r.c, 24, x + w - 20, y + (r.h - 34) / 2, s ? C_WHITE : C_GRAY, 2, w * 55 / 100);
+    }
+}
+
+// 回傳 欄*1000+列 / -1 = B / -9 = +
+static int mainMenu(vector<Row>& L, vector<Row>& Rr, int& col, int& sl, int& sr) {
+    const int VT = 98, VB = 642, VH = VB - VT;
+    vector<Row>* RW[2] = {&L, &Rr};
+    int* SEL[2] = {&sl, &sr};
+    const int PX[2] = {24, 568}, PW[2] = {516, 688};
+    vector<int> ys[2]; int maxS[2]; float scroll[2] = {0, 0}, target[2] = {0, 0};
+    for (int p = 0; p < 2; p++) {
+        auto& rows = *RW[p]; int total = 0;
+        for (auto& r : rows) { ys[p].push_back(total); total += r.h + 8; }
+        maxS[p] = max(0, total - VH);
+        int& sv = *SEL[p];
+        if (sv < 0 || sv >= (int)rows.size() || !rows[sv].ok) {
+            sv = 0; while (sv < (int)rows.size() && !rows[sv].ok) sv++;
+            if (sv >= (int)rows.size()) sv = 0;
+        }
+    }
+    auto ensure = [&](int p) {   // 自動定位
+        auto& rows = *RW[p]; int sv = *SEL[p];
+        float top = ys[p][sv] - 8, bot = ys[p][sv] + rows[sv].h + 8;
+        if (top < target[p]) target[p] = top; else if (bot > target[p] + VH) target[p] = bot - VH;
+        target[p] = max(0.f, min((float)maxS[p], target[p]));
+    };
+    ensure(0); ensure(1);
+    scroll[0] = target[0]; scroll[1] = target[1];
+    bool touching = false, moved = false; int sx = 0, sy = 0, lx = 0, ly = 0, tp = 0, hold = 0;
+    while (appletMainLoop()) {
+        padUpdate(&pad);
+        u64 dn = padGetButtonsDown(&pad), hd = padGetButtons(&pad);
+        if (dn & HidNpadButton_Plus) return -9;
+        if (dn & HidNpadButton_B) return -1;
+        if ((dn & HidNpadButton_A) && (*RW[col])[*SEL[col]].ok) return col * 1000 + *SEL[col];
+        if (dn & HidNpadButton_AnyLeft) { col = 0; ensure(0); }
+        if (dn & HidNpadButton_AnyRight) { col = 1; ensure(1); }
+        int mv = 0;
+        if (dn & HidNpadButton_AnyUp) { mv = -1; hold = 0; }
+        else if (dn & HidNpadButton_AnyDown) { mv = 1; hold = 0; }
+        else if (hd & (HidNpadButton_AnyUp | HidNpadButton_AnyDown)) {
+            if (++hold > 22 && hold % 5 == 0) mv = (hd & HidNpadButton_AnyUp) ? -1 : 1;
+        } else hold = 0;
+        if (mv) {
+            auto& rows = *RW[col];
+            int n = *SEL[col] + mv;
+            while (n >= 0 && n < (int)rows.size() && !rows[n].ok) n += mv;
+            if (n >= 0 && n < (int)rows.size()) { *SEL[col] = n; ensure(col); }
+        }
+        HidTouchScreenState ts = {0};
+        hidGetTouchScreenStates(&ts, 1);
+        if (ts.count > 0) {
+            int tx = ts.touches[0].x, ty = ts.touches[0].y;
+            if (!touching) { touching = true; moved = false; sx = tx; sy = ty; tp = (tx < 556) ? 0 : 1; }
+            else {
+                if (abs(tx - sx) > 14 || abs(ty - sy) > 14) moved = true;
+                if (moved) { scroll[tp] -= (ty - ly); scroll[tp] = max(0.f, min((float)maxS[tp], scroll[tp])); target[tp] = scroll[tp]; }
+            }
+            lx = tx; ly = ty;
+        } else if (touching) {
+            touching = false;
+            if (!moved && ly >= VT && ly < VB) {
+                for (int p = 0; p < 2; p++) {
+                    if (lx < PX[p] || lx >= PX[p] + PW[p]) continue;
+                    auto& rows = *RW[p];
+                    for (size_t i = 0; i < rows.size(); i++) {
+                        float y = VT + ys[p][i] - scroll[p];
+                        if (ly >= y && ly < y + rows[i].h && rows[i].ok) { col = p; *SEL[p] = (int)i; return p * 1000 + (int)i; }
+                    }
+                }
+            }
+        }
+        for (int p = 0; p < 2; p++) {
+            scroll[p] += (target[p] - scroll[p]) * 0.3f;
+            if (fabsf(target[p] - scroll[p]) < 0.5f) scroll[p] = target[p];
+        }
+        rect(0, 0, 1280, 720, C_BG);
+        for (int p = 0; p < 2; p++) {
+            auto& rows = *RW[p];
+            for (size_t i = 0; i < rows.size(); i++) {
+                int y = (int)(VT + ys[p][i] - scroll[p]);
+                if (y + rows[i].h < VT - 10 || y > VB) continue;
+                drawRowAt(rows[i], PX[p], y, PW[p], col == p && (int)i == *SEL[p]);
+            }
+        }
+        rect(553, VT, 2, VB - VT, C_BAR);
+        chrome("Save_WebDAV", "上下 移動　左右 切換　A 選擇　也可直接觸控　+ 離開", false);
+        SDL_RenderPresent(ren);
+    }
+    return -9;
+}
+
 static void mainScreen() {
-    int sel = 0;
+    int col = 0, sl = 0, sr = 0;
     while (true) {
-        vector<Row> r;
-        r.push_back(R(1, "存檔上傳"));
-        r.push_back(R(1, "存檔下載覆蓋"));
-        r.push_back(R(3, "設定"));
-        r.push_back(R(0, "使用者名稱", "", cfg.name.empty() ? "(未設定)" : cfg.name));
-        r.push_back(R(0, "WebDAV 位址", "", cfg.url.empty() ? "(未設定)" : cfg.url));
-        r.push_back(R(0, "帳號", "", cfg.user.empty() ? "(未設定)" : cfg.user));
-        r.push_back(R(0, "密碼", "", cfg.pass.empty() ? "(未設定)" : "********"));
-        r.push_back(R(3, "共享資料夾 (" + to_string(cfg.dirs.size()) + ")  選擇後自動記住"));
-        for (auto& d : cfg.dirs) r.push_back(R(2, baseName(d), d, "移除"));
-        r.push_back(R(0, "+ 新增共享資料夾"));
-        int i = menu("Save_WebDAV", "上下 移動　A 選擇　也可直接觸控　+ 離開", r, sel, false);
+        vector<Row> L, Rr;
+        auto H = [](Row r, int h) { r.h = h; return r; };
+        L.push_back(H(R(1, "存檔上傳"), 76));
+        L.push_back(H(R(1, "存檔下載覆蓋"), 76));
+        L.push_back(H(R(3, "設定"), 36));
+        L.push_back(H(R(0, "使用者名稱", "", cfg.name.empty() ? "(未設定)" : cfg.name), 64));
+        L.push_back(H(R(0, "WebDAV 位址", "", cfg.url.empty() ? "(未設定)" : cfg.url), 64));
+        L.push_back(H(R(0, "帳號", "", cfg.user.empty() ? "(未設定)" : cfg.user), 64));
+        L.push_back(H(R(0, "密碼", "", cfg.pass.empty() ? "(未設定)" : "********"), 64));
+        Rr.push_back(H(R(1, "+ 新增共享資料夾"), 76));
+        Rr.push_back(H(R(3, "共享資料夾 (" + to_string(cfg.dirs.size()) + ")  選擇後自動記住，點一下可移除"), 36));
+        for (auto& d : cfg.dirs) Rr.push_back(H(R(5, baseName(d), d), 84));
+        int i = mainMenu(L, Rr, col, sl, sr);
         if (i == -9) return;
         if (i < 0) continue;
+        int c = i / 1000, idx = i % 1000;
         int n = (int)cfg.dirs.size();
-        sel = i;
-        if (i == 0) doUpload();
-        else if (i == 1) doDownload();
-        else if (i == 3) { if (kbd("使用者名稱 (建議英文或數字)", cfg.name)) { cfg.name = cleanName(cfg.name); saveCfg(); } }
-        else if (i == 4) { if (kbd("WebDAV 位址 (例 https://dav.example.com/ns/)", cfg.url)) saveCfg(); }
-        else if (i == 5) { if (kbd("帳號", cfg.user)) saveCfg(); }
-        else if (i == 6) { string v; if (pwEdit(v)) { cfg.pass = v; saveCfg(); } }
-        else if (i >= 8 && i < 8 + n) {
-            int k = i - 8;
-            if (confirm("移除這個共享資料夾?\n" + cfg.dirs[k], "確定移除")) { cfg.dirs.erase(cfg.dirs.begin() + k); saveCfg(); sel = i - 1; }
-        } else if (i == 8 + n) {
+        if (c == 0) {
+            if (idx == 0) doUpload();
+            else if (idx == 1) doDownload();
+            else if (idx == 3) { if (kbd("使用者名稱 (建議英文或數字)", cfg.name)) { cfg.name = cleanName(cfg.name); saveCfg(); } }
+            else if (idx == 4) { if (kbd("WebDAV 位址 (例 https://dav.example.com/ns/)", cfg.url)) saveCfg(); }
+            else if (idx == 5) { if (kbd("帳號", cfg.user)) saveCfg(); }
+            else if (idx == 6) { string v; if (pwEdit(v)) { cfg.pass = v; saveCfg(); } }
+        } else if (idx == 0) {
             if (n >= 20) continue;
-            string p;
-            if (pickFolder(p)) {
-                auto it = find(cfg.dirs.begin(), cfg.dirs.end(), p);
-                if (it == cfg.dirs.end()) { cfg.dirs.push_back(p); saveCfg(); sel = 8 + (int)cfg.dirs.size() - 1; }
-                else sel = 8 + (int)(it - cfg.dirs.begin());
+            string pth;
+            if (pickFolder(pth)) {
+                auto it = find(cfg.dirs.begin(), cfg.dirs.end(), pth);
+                if (it == cfg.dirs.end()) { cfg.dirs.push_back(pth); saveCfg(); sr = 2 + (int)cfg.dirs.size() - 1; }
+                else sr = 2 + (int)(it - cfg.dirs.begin());
             }
+        } else if (idx >= 2 && idx < 2 + n) {
+            int k = idx - 2;
+            if (confirm("移除這個共享資料夾?\n" + cfg.dirs[k], "確定移除")) { cfg.dirs.erase(cfg.dirs.begin() + k); saveCfg(); sr = max(0, idx - 1); }
         }
     }
 }
