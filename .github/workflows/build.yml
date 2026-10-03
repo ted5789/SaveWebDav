@@ -9,7 +9,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install libs
-        run: dkp-pacman -Sy --noconfirm switch-tools libnx switch-curl switch-libarchive switch-mbedtls switch-zlib switch-pkg-config switch-sdl2 switch-sdl2_ttf switch-freetype
+        run: |
+          PKGS="switch-tools libnx switch-curl switch-libarchive switch-mbedtls switch-zlib switch-pkg-config switch-sdl2 switch-sdl2_ttf switch-freetype"
+          for i in 1 2 3 4 5; do
+            dkp-pacman -Sy --noconfirm --needed $PKGS && exit 0
+            echo "retry $i"
+            sleep $((i*20))
+          done
+          echo "sync failed, trying cached database"
+          dkp-pacman -S --noconfirm --needed $PKGS
       - name: Build
         run: make
       - uses: actions/upload-artifact@v4
