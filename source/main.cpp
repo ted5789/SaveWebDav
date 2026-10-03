@@ -203,6 +203,28 @@ static bool davGet(const string& name, const char* file) {
 }
 
 // ---------- 7z 打包 / 解壓 ----------
+static string packErr;
+static void cleanTmp() {   // libarchive 的 7z 需要暫存檔，Switch 沒有 /tmp，所以指定到 SD 卡
+    DIR* d = opendir(CFG_DIR);
+    if (!d) return;
+    struct dirent* e; vector<string> v;
+    while ((e = readdir(d))) if (!strncmp(e->d_name, "libarchive_", 11)) v.push_back(string(CFG_DIR) + e->d_name);
+    closedir(d);
+    for (auto& f : v) remove(f.c_str());
+}
+static bool verify7z(const char* file) {
+    struct archive* a = archive_read_new();
+    archive_read_support_format_7zip(a);
+    archive_read_support_filter_all(a);
+    bool ok = false;
+    if (archive_read_open_filename(a, file, 1 << 16) == ARCHIVE_OK) {
+        struct archive_entry* e;
+        ok = (archive_read_next_header(a, &e) == ARCHIVE_OK);
+    }
+    if (!ok) logf_("驗證訊息: %s", archive_error_string(a) ? archive_error_string(a) : "未知");
+    archive_read_free(a);
+    return ok;
+}
 static int packedCount = 0;
 static vector<char> ioBuf(1 << 16);
 
@@ -215,9 +237,14 @@ static void addFile(struct archive* a, const string& full, const struct stat& st
     archive_entry_set_filetype(e, AE_IFREG);
     archive_entry_set_perm(e, 0644);
     archive_entry_set_mtime(e, st.st_mtime, 0);
-    archive_write_header(a, e);
+    if (archive_write_header(a, e) < ARCHIVE_WARN) {
+        packErr = archive_error_string(a) ? archive_error_string(a) : "write header";
+        archive_entry_free(e); fclose(f); return;
+    }
     size_t n;
-    while ((n = fread(ioBuf.data(), 1, ioBuf.size(), f)) > 0) archive_write_data(a, ioBuf.data(), n);
+    while ((n = fread(ioBuf.data(), 1, ioBuf.size(), f)) > 0) {
+        if (archive_write_data(a, ioBuf.data(), n) < 0) { packErr = archive_error_string(a) ? archive_error_string(a) : "write data"; break; }
+    }
     archive_entry_free(e);
     fclose(f);
     if (++packedCount % 20 == 0) { logf_("\r已打包 %d 個檔案", packedCount);  }
@@ -228,6 +255,7 @@ static void walk(struct archive* a, const string& dir) {
     if (!d) { logf_("\n找不到資料夾: %s\n", dir.c_str()); return; }
     struct dirent* de;
     while ((de = readdir(d))) {
+        if (!packErr.empty()) break;
         if (!strcmp(de->d_name, ".") || !strcmp(de->d_name, "..")) continue;
         string full = dir + "/" + de->d_name;
         struct stat st;
@@ -237,7 +265,7 @@ static void walk(struct archive* a, const string& dir) {
             archive_entry_set_pathname(e, (full.substr(6) + "/").c_str());
             archive_entry_set_filetype(e, AE_IFDIR);
             archive_entry_set_perm(e, 0755);
-            archive_write_header(a, e);
+            if (archive_write_header(a, e) < ARCHIVE_WARN) packErr = archive_error_string(a) ? archive_error_string(a) : "write dir";
             archive_entry_free(e);
             walk(a, full);
         } else addFile(a, full, st);
@@ -247,6 +275,8 @@ static void walk(struct archive* a, const string& dir) {
 
 static bool packAll() {
     mkdirs(string(CFG_DIR));
+    setenv("TMPDIR", CFG_DIR, 1);
+    cleanTmp(); packErr.clear();
     struct archive* a = archive_write_new();
     archive_write_set_format_7zip(a);
     archive_write_set_format_option(a, "7zip", "compression", "deflate");  // 省記憶體
@@ -259,9 +289,17 @@ static bool packAll() {
         logf_("\n[%02d] %s\n", (int)i + 1, d.c_str());
         walk(a, d);
     }
-    archive_write_close(a);
+    if (archive_write_close(a) < ARCHIVE_WARN && packErr.empty())
+        packErr = archive_error_string(a) ? archive_error_string(a) : "close";
     archive_write_free(a);
-    logf_("\n共打包 %d 個檔案\n", packedCount);
+    cleanTmp();
+    if (!packErr.empty()) { logf_("打包失敗: %s", packErr.c_str()); remove(TMP_FILE); return false; }
+    if (packedCount == 0) { logf_("資料夾內沒有檔案，已取消"); remove(TMP_FILE); return false; }
+    struct stat st;
+    if (stat(TMP_FILE, &st) != 0 || st.st_size <= 0 || !verify7z(TMP_FILE)) {
+        logf_("7z 檔案驗證失敗，已取消上傳"); remove(TMP_FILE); return false;
+    }
+    logf_("共打包 %d 個檔案，大小 %lld KB", packedCount, (long long)(st.st_size / 1024));
     return true;
 }
 
@@ -567,7 +605,7 @@ static void doDownload() {
     if (!confirm("將還原:\n" + names[r] + "\n這會覆蓋 SD 卡上相同路徑的檔案!", "確定還原")) return;
     logs.clear(); mkdirs(string(CFG_DIR));
     logf_("下載中...");
-    if (davGet(names[r], TMP_FILE)) { logf_("解壓中..."); if (unpackAll(TMP_FILE)) logf_("還原完成!"); }
+    if (davGet(names[r], TMP_FILE)) { logf_("解壓中..."); if (unpackAll(TMP_FILE)) logf_("還原完成!"); else logf_("這份 7z 可能是損壞或空的(舊版上傳失敗留下的)，請改選其他版本"); }
     remove(TMP_FILE);
     waitDone();
 }
@@ -630,6 +668,91 @@ static string getNickname() {
     return out;
 }
 
+// ---------- 密碼輸入 (只顯示最後輸入的那一個字，其餘變 *) ----------
+static bool pwEdit(string& out) {
+    static const char* lowR[4] = {"1234567890", "qwertyuiop", "asdfghjkl-", "zxcvbnm.@_"};
+    static const char* upR[4] = {"1234567890", "QWERTYUIOP", "ASDFGHJKL-", "ZXCVBNM.@_"};
+    static const char* symR[4] = {"!@#$%^&*()", "-_=+[]{};:", "'\"\\|/<>?,.", "~`"};
+    static const char* fn[6] = {"大小寫", "符號/字母", "空白", "刪除", "完成", "取消"};
+    string val; bool reveal = false; int page = 0, cr = 1, cc = 0;
+    bool touching = false, moved = false; int sx = 0, sy = 0, lx = 0, ly = 0;
+    auto rows = [&]() -> const char** { return page == 0 ? lowR : page == 1 ? upR : symR; };
+    auto rlen = [&](int r) { return r < 4 ? (int)strlen(rows()[r]) : 6; };
+    auto geom = [&](int r, int c, int& x, int& y, int& w, int& h) {
+        h = 70; y = 230 + r * 78;
+        if (r < 4) { int n = rlen(r); w = 104; int tot = n * 104 + (n - 1) * 8; x = (1280 - tot) / 2 + c * 112; }
+        else { w = 178; x = 84 + c * 186; }
+    };
+    auto press = [&](int r, int c) -> int {
+        if (r < 4) { if ((int)val.size() < 64) { val += rows()[r][c]; reveal = true; } return 0; }
+        switch (c) {
+            case 0: page = (page == 0) ? 1 : 0; break;
+            case 1: page = (page == 2) ? 0 : 2; break;
+            case 2: val += ' '; reveal = true; break;
+            case 3: if (!val.empty()) val.pop_back(); reveal = false; break;
+            case 4: return 1;
+            case 5: return 2;
+        }
+        return 0;
+    };
+    while (appletMainLoop()) {
+        cc = min(cc, rlen(cr) - 1);
+        padUpdate(&pad);
+        u64 dn = padGetButtonsDown(&pad);
+        int res = 0;
+        if (dn & HidNpadButton_AnyUp) cr = (cr + 4) % 5;
+        if (dn & HidNpadButton_AnyDown) cr = (cr + 1) % 5;
+        cc = min(cc, rlen(cr) - 1);
+        if (dn & HidNpadButton_AnyLeft) cc = (cc + rlen(cr) - 1) % rlen(cr);
+        if (dn & HidNpadButton_AnyRight) cc = (cc + 1) % rlen(cr);
+        if (dn & HidNpadButton_A) res = press(cr, cc);
+        if (dn & HidNpadButton_B) res = press(4, 3);
+        if (dn & HidNpadButton_X) page = (page == 0) ? 1 : 0;
+        if (dn & HidNpadButton_Y) page = (page == 2) ? 0 : 2;
+        if (dn & HidNpadButton_Plus) res = 1;
+        if (dn & HidNpadButton_Minus) res = 2;
+        HidTouchScreenState ts = {0};
+        hidGetTouchScreenStates(&ts, 1);
+        if (ts.count > 0) {
+            int tx = ts.touches[0].x, ty = ts.touches[0].y;
+            if (!touching) { touching = true; moved = false; sx = tx; sy = ty; }
+            else if (abs(tx - sx) > 20 || abs(ty - sy) > 20) moved = true;
+            lx = tx; ly = ty;
+        } else if (touching) {
+            touching = false;
+            if (!moved) {
+                bool hit = false;
+                for (int r = 0; r < 5 && !hit; r++)
+                    for (int c = 0; c < rlen(r) && !hit; c++) {
+                        int x, y, w, h; geom(r, c, x, y, w, h);
+                        if (lx >= x && lx < x + w && ly >= y && ly < y + h) { cr = r; cc = c; res = press(r, c); hit = true; }
+                    }
+            }
+        }
+        if (res == 1) { out = val; return true; }
+        if (res == 2) return false;
+
+        rect(0, 0, 1280, 720, C_BG);
+        txt("新密碼 (只顯示最後輸入的字，取消則保留舊密碼)", 20, 84, 96, C_GRAY);
+        rect(84, 128, 1112, 76, C_CARD);
+        string shown;
+        for (size_t i = 0; i < val.size(); i++) shown += (i + 1 == val.size() && reveal) ? string(1, val[i]) : string("*");
+        txt(shown, 40, 104, 142, C_WHITE, 0, 1070);
+        for (int r = 0; r < 5; r++)
+            for (int c = 0; c < rlen(r); c++) {
+                int x, y, w, h; geom(r, c, x, y, w, h);
+                bool sl = (r == cr && c == cc);
+                if (sl) rect(x - 3, y - 3, w + 6, h + 6, C_ACC);
+                rect(x, y, w, h, sl ? C_SEL : C_CARD);
+                string lb = r < 4 ? string(1, rows()[r][c]) : string(fn[c]);
+                txt(lb, r < 4 ? 34 : 26, x + w / 2, y + (h - (r < 4 ? 48 : 38)) / 2, C_WHITE, 1);
+            }
+        chrome("輸入密碼", "A 輸入　B 刪除　X 大小寫　Y 符號　+ 完成　- 取消", false);
+        SDL_RenderPresent(ren);
+    }
+    return false;
+}
+
 static string baseName(const string& p) {
     size_t i = p.rfind('/');
     return (i == string::npos || i + 1 >= p.size()) ? p : p.substr(i + 1);
@@ -659,7 +782,7 @@ static void mainScreen() {
         else if (i == 3) { if (kbd("使用者名稱 (建議英文或數字)", cfg.name)) { cfg.name = cleanName(cfg.name); saveCfg(); } }
         else if (i == 4) { if (kbd("WebDAV 位址 (例 https://dav.example.com/ns/)", cfg.url)) saveCfg(); }
         else if (i == 5) { if (kbd("帳號", cfg.user)) saveCfg(); }
-        else if (i == 6) { if (kbd("密碼", cfg.pass, true)) saveCfg(); }
+        else if (i == 6) { string v; if (pwEdit(v)) { cfg.pass = v; saveCfg(); } }
         else if (i >= 8 && i < 8 + n) {
             int k = i - 8;
             if (confirm("移除這個共享資料夾?\n" + cfg.dirs[k], "確定移除")) { cfg.dirs.erase(cfg.dirs.begin() + k); saveCfg(); sel = i - 1; }
