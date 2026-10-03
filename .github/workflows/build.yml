@@ -1,0 +1,18 @@
+name: Build NRO
+on:
+  push:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container: devkitpro/devkita64:latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install libs
+        run: dkp-pacman -Sy --noconfirm switch-tools libnx switch-curl switch-libarchive switch-mbedtls switch-zlib switch-pkg-config switch-sdl2 switch-sdl2_ttf switch-freetype
+      - name: Build
+        run: make
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Save_WebDAV
+          path: Save_WebDAV.nro
