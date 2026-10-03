@@ -28,10 +28,15 @@ struct Cfg { string url, user, pass, name; vector<string> dirs; } cfg;
 static PadState pad;
 static void logf_(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
 static int progLast = -1;
+static bool pgActive = false, pgOk = false, pgErr = false;
+static int pgPct = 0, pgBase = 0, pgSpan = 100, totalFiles = 0, restoredCount = 0, archTotal = 0;
+static string pgTitle, pgStage;
+static vector<string> pgList;
+static void setPct(int p);
 static string esc(const string& n) { char* e = curl_easy_escape(NULL, n.c_str(), 0); string r = e ? e : n; if (e) curl_free(e); return r; }
 static int prog(void*, curl_off_t dt, curl_off_t dn, curl_off_t ut, curl_off_t un) {
     curl_off_t t = dt ? dt : ut, n = dt ? dn : un;
-    if (t > 0) { int p = (int)(n * 100 / t); if (p != progLast) { progLast = p; logf_("\r進度 %d%%", p); } }
+    if (t > 0) { int p = (int)(n * 100 / t); if (p != progLast) { progLast = p; setPct(pgBase + p * pgSpan / 100); } }
     return 0;
 }
 
@@ -165,7 +170,7 @@ static bool davPut(const string& name, const char* file) {
     curl_slist* h = curl_slist_append(NULL, "Expect:");
     curl_easy_setopt(c, CURLOPT_HTTPHEADER, h);
     curl_easy_setopt(c, CURLOPT_UPLOAD, 1L);
-    curl_easy_setopt(c, CURLOPT_NOPROGRESS, 0L); curl_easy_setopt(c, CURLOPT_XFERINFOFUNCTION, prog); progLast = -1; logf_("進度 0%%");
+    curl_easy_setopt(c, CURLOPT_NOPROGRESS, 0L); curl_easy_setopt(c, CURLOPT_XFERINFOFUNCTION, prog); progLast = -1;
     curl_easy_setopt(c, CURLOPT_READFUNCTION, cbR);
     curl_easy_setopt(c, CURLOPT_READDATA, f);
     curl_easy_setopt(c, CURLOPT_INFILESIZE_LARGE, (curl_off_t)sz);
@@ -194,7 +199,7 @@ static bool davGet(const string& name, const char* file) {
     CURL* c = mk(baseUrl() + esc(name));
     curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, cbW);
     curl_easy_setopt(c, CURLOPT_WRITEDATA, f);
-    curl_easy_setopt(c, CURLOPT_NOPROGRESS, 0L); curl_easy_setopt(c, CURLOPT_XFERINFOFUNCTION, prog); progLast = -1; logf_("進度 0%%");
+    curl_easy_setopt(c, CURLOPT_NOPROGRESS, 0L); curl_easy_setopt(c, CURLOPT_XFERINFOFUNCTION, prog); progLast = -1;
     CURLcode rc = curl_easy_perform(c);
     long code = 0; curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &code);
     curl_easy_cleanup(c); fclose(f);
@@ -203,6 +208,21 @@ static bool davGet(const string& name, const char* file) {
 }
 
 // ---------- 7z 打包 / 解壓 ----------
+static int countFiles(const string& dir) {
+    int n = 0;
+    DIR* d = opendir(dir.c_str());
+    if (!d) return 0;
+    struct dirent* de;
+    while ((de = readdir(d))) {
+        if (!strcmp(de->d_name, ".") || !strcmp(de->d_name, "..")) continue;
+        string f = dir + "/" + de->d_name;
+        struct stat st;
+        if (stat(f.c_str(), &st) != 0) continue;
+        if (S_ISDIR(st.st_mode)) n += countFiles(f); else n++;
+    }
+    closedir(d);
+    return n;
+}
 static string packErr;
 static void cleanTmp() {   // libarchive 的 7z 需要暫存檔，Switch 沒有 /tmp，所以指定到 SD 卡
     DIR* d = opendir(CFG_DIR);
@@ -247,7 +267,8 @@ static void addFile(struct archive* a, const string& full, const struct stat& st
     }
     archive_entry_free(e);
     fclose(f);
-    if (++packedCount % 20 == 0) { logf_("\r已打包 %d 個檔案", packedCount);  }
+    ++packedCount;
+    if (totalFiles > 0) { int p = pgBase + (int)((long long)packedCount * pgSpan / totalFiles); if (p > pgPct) setPct(p); }
 }
 
 static void walk(struct archive* a, const string& dir) {
@@ -284,7 +305,7 @@ static bool packAll() {
         logf_("無法建立暫存檔\n"); archive_write_free(a); return false;
     }
     {   // 把「共享資料夾清單」一起放進 7z，還原時自動加入
-        string man;
+        string man = "#files=" + to_string(totalFiles) + "\n";
         for (auto& d0 : cfg.dirs) man += normDir(d0) + "\n";
         struct archive_entry* me = archive_entry_new();
         archive_entry_set_pathname(me, "Save_WebDAV_folders.txt");
@@ -299,7 +320,6 @@ static bool packAll() {
     packedCount = 0;
     for (size_t i = 0; i < cfg.dirs.size(); i++) {
         string d = normDir(cfg.dirs[i]);
-        logf_("\n[%02d] %s\n", (int)i + 1, d.c_str());
         walk(a, d);
     }
     if (archive_write_close(a) < ARCHIVE_WARN && packErr.empty())
@@ -312,7 +332,6 @@ static bool packAll() {
     if (stat(TMP_FILE, &st) != 0 || st.st_size <= 0 || !verify7z(TMP_FILE)) {
         logf_("7z 檔案驗證失敗，已取消上傳"); remove(TMP_FILE); return false;
     }
-    logf_("共打包 %d 個檔案，大小 %lld KB", packedCount, (long long)(st.st_size / 1024));
     return true;
 }
 
@@ -338,7 +357,11 @@ static bool unpackAll(const char* file) {
     }
     struct archive_entry* e;
     int n = 0;
+    archTotal = 0; restoredCount = 0;
+    struct stat fst; long long fsz = (stat(file, &fst) == 0) ? (long long)fst.st_size : 1;
+    long long b0 = -1;
     while (archive_read_next_header(a, &e) == ARCHIVE_OK) {
+        if (b0 < 0) b0 = (long long)archive_filter_bytes(a, 0);
         string name = archive_entry_pathname(e);
         if (!safeName(name)) { logf_("\n略過不安全路徑: %s\n", name.c_str()); continue; }
         if (name == "Save_WebDAV_folders.txt") {   // 清單檔: 不寫到 SD 卡，直接加入共享資料夾
@@ -350,6 +373,7 @@ static bool unpackAll(const char* file) {
                 string ln = content.substr(i2, e2 - i2); i2 = e2 + 1;
                 while (!ln.empty() && ln.back() == '\r') ln.pop_back();
                 if (ln.empty()) continue;
+                if (ln[0] == '#') { if (ln.rfind("#files=", 0) == 0) archTotal = atoi(ln.c_str() + 7); continue; }
                 ln = normDir(ln);
                 if (cfg.dirs.size() < 20 && find(cfg.dirs.begin(), cfg.dirs.end(), ln) == cfg.dirs.end()) { cfg.dirs.push_back(ln); added++; }
             }
@@ -362,12 +386,19 @@ static bool unpackAll(const char* file) {
         FILE* f = fopen(target.c_str(), "wb");
         if (!f) { logf_("\n無法寫入: %s\n", target.c_str()); continue; }
         ssize_t r;
-        while ((r = archive_read_data(a, ioBuf.data(), ioBuf.size())) > 0) fwrite(ioBuf.data(), 1, r, f);
+        while ((r = archive_read_data(a, ioBuf.data(), ioBuf.size())) > 0) {
+            fwrite(ioBuf.data(), 1, r, f);
+            if (archTotal <= 0) {   // 舊備份沒有檔案數: 改用已讀取的資料量估算
+                long long denom = max(1LL, fsz - b0);
+                int p = pgBase + (int)(max(0LL, (long long)archive_filter_bytes(a, 0) - b0) * pgSpan / denom);
+                if (p > pgPct) setPct(p);
+            }
+        }
         fclose(f);
-        if (++n % 20 == 0) { logf_("\r已還原 %d 個檔案", n);  }
+        n++; restoredCount = n;
+        if (archTotal > 0) { int p = pgBase + (int)((long long)n * pgSpan / archTotal); if (p > pgPct) setPct(p); }
     }
     archive_read_free(a);
-    logf_("\n共還原 %d 個檔案\n", n);
     return true;
 }
 
@@ -550,13 +581,41 @@ static bool confirm(const string& msg, const string& yes) {
 
 // ---------- 進度記錄畫面 ----------
 static deque<string> logs;
-static string logHint = "處理中，請稍候...";
+static string logHint = "處理中，請勿關閉程式";
+static const Col C_ERR = {232, 126, 92};
+
+static void pgStart(const string& title, const string& stage) {
+    pgActive = true; pgOk = false; pgErr = false; pgPct = 0; pgBase = 0; pgSpan = 100;
+    pgTitle = title; pgStage = stage; pgList.clear(); logs.clear();
+}
 static void drawLog() {
     rect(0, 0, 1280, 720, C_BG);
-    size_t st = logs.size() > 14 ? logs.size() - 14 : 0;
-    for (size_t i = st; i < logs.size(); i++) txt(logs[i], 24, 48, 108 + (int)(i - st) * 36, C_WHITE, 0, 1180);
-    chrome("Save_WebDAV", logHint, false);
+    if (!pgActive) {
+        size_t st = logs.size() > 14 ? logs.size() - 14 : 0;
+        for (size_t i = st; i < logs.size(); i++) txt(logs[i], 24, 48, 108 + (int)(i - st) * 36, C_WHITE, 0, 1180);
+        chrome("Save_WebDAV", logHint, false);
+    } else {
+        txt(pgStage, 30, 48, 98, pgOk ? C_ACC : (pgErr ? C_ERR : C_WHITE), 0, 1180);
+        int ly0 = 150; size_t maxL = 11;
+        if (!pgList.empty()) {   // 打包的資料夾總目錄 (兩欄, 最多 20 個)
+            for (size_t i = 0; i < pgList.size() && i < 20; i++)
+                txt(pgList[i], 22, 48 + (int)(i / 10) * 600, 150 + (int)(i % 10) * 31, C_MARK, 0, 570);
+            ly0 = 476; maxL = 3;
+        }
+        size_t st = logs.size() > maxL ? logs.size() - maxL : 0;
+        for (size_t i = st; i < logs.size(); i++) txt(logs[i], 22, 48, ly0 + (int)(i - st) * 30, C_GRAY, 0, 1180);
+        rect(48, 580, 1184, 38, C_CARD);
+        rect(48, 580, 1184 * pgPct / 100, 38, pgErr ? C_ERR : C_ACC);
+        txt(to_string(pgPct) + "%", 26, 640, 584, pgPct >= 50 ? C_DARK : C_WHITE, 1);
+        chrome(pgTitle, logHint, false);
+    }
     SDL_RenderPresent(ren);
+}
+static void setPct(int p) {   // 進行中最多顯示 99%，100% 只在全部完成時才出現
+    if (p > 99) p = 99;
+    if (p <= pgPct) return;
+    pgPct = p;
+    drawLog();
 }
 static void logf_(const char* fmt, ...) {
     char buf[1024];
@@ -574,6 +633,7 @@ static void logf_(const char* fmt, ...) {
     drawLog();
 }
 static void waitDone() {
+    if (pgActive && !pgOk) { pgErr = true; pgStage = "未完成，請看下方訊息"; }
     logHint = "按 A / B 或點一下螢幕返回";
     bool touching = false;
     while (appletMainLoop()) {
@@ -584,7 +644,13 @@ static void waitDone() {
         if (ts.count > 0) touching = true; else if (touching) break;
         drawLog();
     }
-    logHint = "處理中，請稍候...";
+    logHint = "處理中，請勿關閉程式";
+    pgActive = false; pgOk = false; pgErr = false;
+}
+static void finishOK(const string& msg) {   // 100% 與完成訊息同時出現
+    pgPct = 100; pgStage = msg; pgOk = true;
+    drawLog();
+    waitDone();
 }
 
 // ---------- 功能 ----------
@@ -594,20 +660,30 @@ static string cleanName(string s) {
 }
 
 static void doUpload() {
-    logs.clear();
+    pgStart("存檔上傳", "準備中...");
     if (cfg.url.empty()) { logf_("請先設定 WebDAV 位址"); waitDone(); return; }
     if (cfg.dirs.empty()) { logf_("請先新增至少一個共享資料夾"); waitDone(); return; }
     string user = cfg.name.empty() ? "Switch" : cfg.name;
-    logf_("開始打包...");
+    for (size_t i = 0; i < cfg.dirs.size(); i++) pgList.push_back(to_string(i + 1) + "  " + normDir(cfg.dirs[i]));
+    pgStage = "1/2  開始打包 (掃描檔案中...)"; drawLog();
+    totalFiles = 0;
+    for (auto& d : cfg.dirs) totalFiles += countFiles(normDir(d));
+    pgStage = "1/2  打包中  共 " + to_string(totalFiles) + " 個檔案"; pgBase = 0; pgSpan = 50; drawLog();
     if (!packAll()) { waitDone(); return; }
+
     time_t t = time(NULL); struct tm* lt = localtime(&t);
     char date[16]; strftime(date, sizeof date, "%Y%m%d", lt);
     string nm = "Save_" + user + "_" + date + ".7z";
-    logf_("上傳 %s", nm.c_str());
+    struct stat st; long long kb = 0;
+    if (stat(TMP_FILE, &st) == 0) kb = (long long)st.st_size / 1024;
+    pgBase = 50; pgSpan = 49; setPct(50);
+    pgStage = "2/2  上傳中  " + nm + "  (" + to_string(packedCount) + " 個檔案, " + to_string(kb) + " KB)";
+    drawLog();
     bool ok = davPut(nm, TMP_FILE);
     remove(TMP_FILE);
     if (!ok) { waitDone(); return; }
-    logf_("上傳完成");
+
+    pgStage = "2/2  整理舊版本中..."; drawLog();
     string prefix = "Save_" + user + "_";
     vector<string> names;
     if (davList(names, prefix)) {
@@ -615,12 +691,11 @@ static void doUpload() {
         for (size_t i = KEEP; i < names.size(); i++)
             logf_("刪除舊版本: %s %s", names[i].c_str(), davDel(names[i]) ? "OK" : "失敗");
     }
-    logf_("全部完成!");
-    waitDone();
+    finishOK("上傳完成!  " + nm);
 }
 
 static void doDownload() {
-    logs.clear();
+    pgActive = false; logs.clear();
     if (cfg.url.empty()) { logf_("請先設定 WebDAV 位址"); waitDone(); return; }
     logf_("讀取遠端列表...");
     vector<string> names;
@@ -631,9 +706,19 @@ static void doDownload() {
     int r = menu("選擇要還原的版本", "A 選擇　B 返回　可觸控", rows, sel, true);
     if (r < 0) return;
     if (!confirm("將還原:\n" + names[r] + "\n這會覆蓋 SD 卡上相同路徑的檔案!", "確定還原")) return;
-    logs.clear(); mkdirs(string(CFG_DIR));
-    logf_("下載中...");
-    if (davGet(names[r], TMP_FILE)) { logf_("解壓中..."); if (unpackAll(TMP_FILE)) logf_("還原完成!"); else logf_("這份 7z 可能是損壞或空的(舊版上傳失敗留下的)，請改選其他版本"); }
+    pgStart("存檔下載覆蓋", "1/2  下載中  " + names[r]);
+    pgBase = 0; pgSpan = 40; drawLog();
+    mkdirs(string(CFG_DIR));
+    if (davGet(names[r], TMP_FILE)) {
+        pgBase = 40; pgSpan = 59; setPct(40);
+        pgStage = "2/2  解壓還原中，請勿關閉程式"; drawLog();
+        if (unpackAll(TMP_FILE)) {
+            remove(TMP_FILE);
+            finishOK("還原完成!  共 " + to_string(restoredCount) + " 個檔案");
+            return;
+        }
+        logf_("這份 7z 可能是損壞或空的(舊版上傳失敗留下的)，請改選其他版本");
+    }
     remove(TMP_FILE);
     waitDone();
 }
