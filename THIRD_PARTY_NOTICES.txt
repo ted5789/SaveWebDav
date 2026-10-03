@@ -1,0 +1,60 @@
+THIRD-PARTY NOTICES
+第三方函式庫聲明
+
+本程式（Save WebDAV）以 MIT 授權釋出（見 LICENSE）。
+本程式在編譯時使用下列第三方開源函式庫，各函式庫仍適用其原本的授權條款。
+完整授權全文請見各專案官方網站或原始碼庫中的 LICENSE / COPYING 檔案。
+
+------------------------------------------------------------
+1. libnx
+   授權：ISC License
+   來源：https://github.com/switchbrew/libnx
+
+2. SDL2
+   授權：zlib License
+   來源：https://github.com/libsdl-org/SDL
+
+3. SDL2_ttf
+   授權：zlib License
+   來源：https://github.com/libsdl-org/SDL_ttf
+
+4. libcurl
+   授權：curl License（類似 MIT/X 的寬鬆授權）
+   來源：https://curl.se/docs/copyright.html
+
+5. libarchive
+   授權：BSD 3-Clause License（部分檔案為 BSD 2-Clause 或公共領域）
+   來源：https://github.com/libarchive/libarchive
+
+6. Mbed TLS
+   授權：本程式選擇以 Apache License 2.0 使用（該專案為 Apache 2.0 或 GPL-2.0-or-later 雙授權）
+   來源：https://github.com/Mbed-TLS/mbedtls
+
+7. Zstandard (zstd)
+   授權：本程式選擇以 BSD License 使用（該專案為 BSD 或 GPL-2.0 雙授權）
+   來源：https://github.com/facebook/zstd
+
+8. XZ Utils / liblzma
+   授權：公共領域（Public Domain）
+   來源：https://tukaani.org/xz/
+
+9. bzip2 / libbz2
+   授權：BSD-style License
+   來源：https://sourceware.org/bzip2/
+
+10. zlib
+    授權：zlib License
+    來源：https://zlib.net/
+
+11. FreeType
+    授權：本程式選擇以 FreeType License (FTL) 使用（該專案為 FTL 或 GPL-2.0 雙授權）
+    來源：https://freetype.org/
+
+------------------------------------------------------------
+FreeType 聲明：
+Portions of this software are copyright © The FreeType Project
+(www.freetype.org). All rights reserved.
+
+------------------------------------------------------------
+本檔案僅列出所使用的函式庫與其授權名稱，並非各授權條款的全文。
+各函式庫的版權人與授權全文，請以其官方來源為準。
