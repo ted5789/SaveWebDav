@@ -22,6 +22,8 @@ using namespace std;
 static const char* CFG_DIR = "sdmc:/config/Save_WebDAV/";
 static const char* CFG_FILE = "sdmc:/config/Save_WebDAV/config.txt";
 static const char* TMP_FILE = "sdmc:/config/Save_WebDAV/tmp.7z";
+static const char* BEFORE_FILE = "sdmc:/config/Save_WebDAV/before_restore.7z";
+static const char* TEST_FILE = "sdmc:/config/Save_WebDAV/test.tmp";
 static const size_t KEEP = 5;
 
 struct Cfg { string url, user, pass, name; vector<string> dirs; } cfg;
@@ -33,8 +35,17 @@ static int pgPct = 0, pgBase = 0, pgSpan = 100, totalFiles = 0, restoredCount = 
 static string pgTitle, pgStage;
 static vector<string> pgList;
 static void setPct(int p);
+static long long totalBytes = 0;
+static bool gCancel = false;   // 按住 B 取消
+static bool cancelReq(bool force = false) {
+    static int c = 0;
+    if (gCancel) return true;
+    if (force || (++c & 7) == 0) { padUpdate(&pad); if (padGetButtons(&pad) & HidNpadButton_B) gCancel = true; }
+    return gCancel;
+}
 static string esc(const string& n) { char* e = curl_easy_escape(NULL, n.c_str(), 0); string r = e ? e : n; if (e) curl_free(e); return r; }
 static int prog(void*, curl_off_t dt, curl_off_t dn, curl_off_t ut, curl_off_t un) {
+    if (cancelReq(true)) return 1;
     curl_off_t t = dt ? dt : ut, n = dt ? dn : un;
     if (t > 0) { int p = (int)(n * 100 / t); if (p != progLast) { progLast = p; setPct(pgBase + p * pgSpan / 100); } }
     return 0;
@@ -109,6 +120,36 @@ static size_t cbStr(void* p, size_t s, size_t n, void* u) { ((string*)u)->append
 static size_t cbW(void* p, size_t s, size_t n, void* u) { return fwrite(p, s, n, (FILE*)u); }
 static size_t cbR(void* p, size_t s, size_t n, void* u) { return fread(p, s, n, (FILE*)u); }
 
+static long lastHttp = 0;
+static CURLcode lastRc = CURLE_OK;
+
+static string describeErr() {   // 把錯誤代碼翻成中文
+    switch (lastRc) {
+        case CURLE_OK: break;
+        case CURLE_UNSUPPORTED_PROTOCOL: case CURLE_URL_MALFORMAT: return "網址格式錯誤，請檢查 WebDAV 位址";
+        case CURLE_COULDNT_RESOLVE_HOST: return "找不到伺服器，請檢查網址或網路連線";
+        case CURLE_COULDNT_CONNECT: return "無法連線到伺服器，請檢查網路或網址";
+        case CURLE_OPERATION_TIMEDOUT: return "連線逾時，網路太慢或已中斷";
+        case CURLE_SSL_CONNECT_ERROR: case CURLE_PEER_FAILED_VERIFICATION: return "HTTPS 連線失敗";
+        case CURLE_ABORTED_BY_CALLBACK: return "已取消";
+        case CURLE_SEND_ERROR: case CURLE_RECV_ERROR: case CURLE_GOT_NOTHING: return "網路中斷或伺服器沒有回應";
+        case CURLE_WRITE_ERROR: return "寫入 SD 卡失敗，空間可能不足";
+        default: return "網路錯誤 (代碼 " + to_string((int)lastRc) + ")";
+    }
+    switch (lastHttp) {
+        case 401: return "帳號或密碼錯誤 (HTTP 401)";
+        case 403: return "沒有權限，請確認帳號權限 (HTTP 403)";
+        case 404: return "WebDAV 資料夾或檔案不存在，請檢查位址 (HTTP 404)";
+        case 405: return "伺服器不接受這個操作，位址可能不是 WebDAV 資料夾 (HTTP 405)";
+        case 409: return "上層資料夾不存在 (HTTP 409)";
+        case 423: return "檔案被鎖定 (HTTP 423)";
+        case 507: return "伺服器空間不足 (HTTP 507)";
+        default: break;
+    }
+    if (lastHttp >= 500) return "伺服器發生錯誤 (HTTP " + to_string(lastHttp) + ")";
+    return "伺服器回應異常 (HTTP " + to_string(lastHttp) + ")";
+}
+
 static CURL* mk(const string& url) {
     CURL* c = curl_easy_init();
     curl_easy_setopt(c, CURLOPT_URL, url.c_str());
@@ -119,25 +160,36 @@ static CURL* mk(const string& url) {
     curl_easy_setopt(c, CURLOPT_SSL_VERIFYHOST, 0L);
     curl_easy_setopt(c, CURLOPT_FOLLOWLOCATION, 1L);
     curl_easy_setopt(c, CURLOPT_CONNECTTIMEOUT, 20L);
+    curl_easy_setopt(c, CURLOPT_LOW_SPEED_LIMIT, 1024L);   // 40 秒內速度低於 1KB/s 就當作斷線
+    curl_easy_setopt(c, CURLOPT_LOW_SPEED_TIME, 40L);
     return c;
 }
+static bool run(CURL* c) {
+    lastRc = curl_easy_perform(c);
+    lastHttp = 0;
+    curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &lastHttp);
+    return lastRc == CURLE_OK && lastHttp >= 200 && lastHttp < 300;
+}
+
+static bool davPropfind(int depth, string* body) {
+    CURL* c = mk(baseUrl());
+    string sink;
+    curl_slist* h = curl_slist_append(NULL, depth ? "Depth: 1" : "Depth: 0");
+    curl_easy_setopt(c, CURLOPT_CUSTOMREQUEST, "PROPFIND");
+    curl_easy_setopt(c, CURLOPT_HTTPHEADER, h);
+    curl_easy_setopt(c, CURLOPT_TIMEOUT, 60L);
+    curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, cbStr);
+    curl_easy_setopt(c, CURLOPT_WRITEDATA, body ? body : &sink);
+    bool ok = run(c);
+    curl_slist_free_all(h); curl_easy_cleanup(c);
+    return ok;
+}
+static bool davExists() { return davPropfind(0, NULL); }
 
 static bool davList(vector<string>& names, const string& prefix) {
     names.clear();
-    CURL* c = mk(baseUrl());
     string body;
-    curl_slist* h = curl_slist_append(NULL, "Depth: 1");
-    curl_easy_setopt(c, CURLOPT_CUSTOMREQUEST, "PROPFIND");
-    curl_easy_setopt(c, CURLOPT_HTTPHEADER, h);
-    curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, cbStr);
-    curl_easy_setopt(c, CURLOPT_WRITEDATA, &body);
-    CURLcode rc = curl_easy_perform(c);
-    long code = 0; curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &code);
-    curl_slist_free_all(h); curl_easy_cleanup(c);
-    if (rc != CURLE_OK || code < 200 || code >= 300) {
-        logf_("列出遠端失敗 (curl=%d, http=%ld)\n", (int)rc, code);
-        return false;
-    }
+    if (!davPropfind(1, &body)) { logf_("讀取遠端失敗: %s", describeErr().c_str()); return false; }
     string low = body;
     for (auto& ch : low) ch = tolower((unsigned char)ch);
     size_t pos = 0;
@@ -151,20 +203,21 @@ static bool davList(vector<string>& names, const string& prefix) {
         string nm = (sl == string::npos) ? href : href.substr(sl + 1);
         char* un = curl_easy_unescape(NULL, nm.c_str(), 0, NULL);
         if (un) { nm = un; curl_free(un); }
-        if (nm.rfind(prefix, 0) == 0 && nm.size() > 11 && nm.substr(nm.size() - 3) == ".7z"
+        // 檔名格式: Save_名稱_YYYYMMDD_HHMMSS.7z  (.tmp 是上傳中的暫存檔，不列入)
+        if (nm.rfind(prefix, 0) == 0 && nm.size() > 18 && nm.substr(nm.size() - 3) == ".7z"
             && find(names.begin(), names.end(), nm) == names.end())
             names.push_back(nm);
         pos = e;
     }
     sort(names.begin(), names.end(), [](const string& x, const string& y) {
-        string dx = x.substr(x.size() - 11, 8), dy = y.substr(y.size() - 11, 8);
+        string dx = x.substr(x.size() - 18, 15), dy = y.substr(y.size() - 18, 15);
         return dx != dy ? dx > dy : x > y; });   // 新 -> 舊
     return true;
 }
 
 static bool davPut(const string& name, const char* file) {
     FILE* f = fopen(file, "rb");
-    if (!f) return false;
+    if (!f) { lastRc = CURLE_READ_ERROR; lastHttp = 0; return false; }
     fseek(f, 0, SEEK_END); long sz = ftell(f); fseek(f, 0, SEEK_SET);
     CURL* c = mk(baseUrl() + esc(name));
     curl_slist* h = curl_slist_append(NULL, "Expect:");
@@ -174,11 +227,12 @@ static bool davPut(const string& name, const char* file) {
     curl_easy_setopt(c, CURLOPT_READFUNCTION, cbR);
     curl_easy_setopt(c, CURLOPT_READDATA, f);
     curl_easy_setopt(c, CURLOPT_INFILESIZE_LARGE, (curl_off_t)sz);
-    CURLcode rc = curl_easy_perform(c);
-    long code = 0; curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &code);
+    string sink;
+    curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, cbStr);
+    curl_easy_setopt(c, CURLOPT_WRITEDATA, &sink);
+    bool ok = run(c);
     curl_slist_free_all(h); curl_easy_cleanup(c); fclose(f);
-    if (rc != CURLE_OK || code < 200 || code >= 300) { logf_("上傳失敗 (curl=%d, http=%ld)\n", (int)rc, code); return false; }
-    return true;
+    return ok;
 }
 
 static bool davDel(const string& name) {
@@ -187,24 +241,73 @@ static bool davDel(const string& name) {
     curl_easy_setopt(c, CURLOPT_CUSTOMREQUEST, "DELETE");
     curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, cbStr);
     curl_easy_setopt(c, CURLOPT_WRITEDATA, &sink);
-    CURLcode rc = curl_easy_perform(c);
-    long code = 0; curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &code);
+    bool ok = run(c);
     curl_easy_cleanup(c);
-    return rc == CURLE_OK && code >= 200 && code < 300;
+    return ok;
+}
+
+static bool davMove(const string& from, const string& to) {   // 上傳完才改成正式檔名
+    CURL* c = mk(baseUrl() + esc(from));
+    string dest = "Destination: " + baseUrl() + esc(to);
+    curl_slist* h = curl_slist_append(NULL, dest.c_str());
+    h = curl_slist_append(h, "Overwrite: T");
+    string sink;
+    curl_easy_setopt(c, CURLOPT_CUSTOMREQUEST, "MOVE");
+    curl_easy_setopt(c, CURLOPT_HTTPHEADER, h);
+    curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, cbStr);
+    curl_easy_setopt(c, CURLOPT_WRITEDATA, &sink);
+    bool ok = run(c);
+    curl_slist_free_all(h); curl_easy_cleanup(c);
+    return ok;
+}
+
+static long long davSize(const string& name) {   // 取得遠端檔案大小，-1 = 不知道
+    CURL* c = mk(baseUrl() + esc(name));
+    curl_easy_setopt(c, CURLOPT_NOBODY, 1L);
+    bool ok = run(c);
+    curl_off_t len = -1;
+    if (ok) curl_easy_getinfo(c, CURLINFO_CONTENT_LENGTH_DOWNLOAD_T, &len);
+    curl_easy_cleanup(c);
+    return ok ? (long long)len : -1;
 }
 
 static bool davGet(const string& name, const char* file) {
     FILE* f = fopen(file, "wb");
-    if (!f) return false;
+    if (!f) { lastRc = CURLE_WRITE_ERROR; lastHttp = 0; return false; }
     CURL* c = mk(baseUrl() + esc(name));
     curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, cbW);
     curl_easy_setopt(c, CURLOPT_WRITEDATA, f);
     curl_easy_setopt(c, CURLOPT_NOPROGRESS, 0L); curl_easy_setopt(c, CURLOPT_XFERINFOFUNCTION, prog); progLast = -1;
-    CURLcode rc = curl_easy_perform(c);
-    long code = 0; curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &code);
+    bool ok = run(c);
     curl_easy_cleanup(c); fclose(f);
-    if (rc != CURLE_OK || code < 200 || code >= 300) { logf_("下載失敗 (curl=%d, http=%ld)\n", (int)rc, code); return false; }
-    return true;
+    if (!ok) remove(file);
+    return ok;
+}
+
+static bool davMkcolAbs(const string& url) {
+    CURL* c = mk(url);
+    string sink;
+    curl_easy_setopt(c, CURLOPT_CUSTOMREQUEST, "MKCOL");
+    curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, cbStr);
+    curl_easy_setopt(c, CURLOPT_WRITEDATA, &sink);
+    bool ok = run(c);
+    curl_easy_cleanup(c);
+    return ok;
+}
+static bool davEnsureDir() {   // 逐層建立 WebDAV 位址裡的資料夾
+    string u = baseUrl();
+    size_t p = u.find("://");
+    if (p == string::npos) return false;
+    size_t i = u.find('/', p + 3);
+    if (i == string::npos) return davExists();
+    i++;
+    while (i < u.size()) {
+        size_t e = u.find('/', i);
+        if (e == string::npos) break;
+        davMkcolAbs(u.substr(0, e + 1));   // 已存在會回 405，不用理會
+        i = e + 1;
+    }
+    return davExists();
 }
 
 // ---------- 7z 打包 / 解壓 ----------
@@ -218,7 +321,7 @@ static int countFiles(const string& dir) {
         string f = dir + "/" + de->d_name;
         struct stat st;
         if (stat(f.c_str(), &st) != 0) continue;
-        if (S_ISDIR(st.st_mode)) n += countFiles(f); else n++;
+        if (S_ISDIR(st.st_mode)) n += countFiles(f); else { n++; totalBytes += (long long)st.st_size; }
     }
     closedir(d);
     return n;
@@ -231,19 +334,6 @@ static void cleanTmp() {   // libarchive 的 7z 需要暫存檔，Switch 沒有 
     while ((e = readdir(d))) if (!strncmp(e->d_name, "libarchive_", 11)) v.push_back(string(CFG_DIR) + e->d_name);
     closedir(d);
     for (auto& f : v) remove(f.c_str());
-}
-static bool verify7z(const char* file) {
-    struct archive* a = archive_read_new();
-    archive_read_support_format_7zip(a);
-    archive_read_support_filter_all(a);
-    bool ok = false;
-    if (archive_read_open_filename(a, file, 1 << 16) == ARCHIVE_OK) {
-        struct archive_entry* e;
-        ok = (archive_read_next_header(a, &e) == ARCHIVE_OK);
-    }
-    if (!ok) logf_("驗證訊息: %s", archive_error_string(a) ? archive_error_string(a) : "未知");
-    archive_read_free(a);
-    return ok;
 }
 static int packedCount = 0;
 static vector<char> ioBuf(1 << 16);
@@ -263,6 +353,7 @@ static void addFile(struct archive* a, const string& full, const struct stat& st
     }
     size_t n;
     while ((n = fread(ioBuf.data(), 1, ioBuf.size(), f)) > 0) {
+        if (cancelReq()) { packErr = "已取消"; break; }
         if (archive_write_data(a, ioBuf.data(), n) < 0) { packErr = archive_error_string(a) ? archive_error_string(a) : "write data"; break; }
     }
     archive_entry_free(e);
@@ -292,6 +383,33 @@ static void walk(struct archive* a, const string& dir) {
         } else addFile(a, full, st);
     }
     closedir(d);
+}
+
+static bool verify7zFull(const char* file, int expectFiles) {   // 完整讀過一遍，確認沒壞
+    struct archive* a = archive_read_new();
+    archive_read_support_format_7zip(a);
+    archive_read_support_filter_all(a);
+    if (archive_read_open_filename(a, file, 1 << 16) != ARCHIVE_OK) {
+        logf_("驗證失敗: %s", archive_error_string(a) ? archive_error_string(a) : "無法開啟");
+        archive_read_free(a); return false;
+    }
+    struct archive_entry* e; int files = 0, hr; bool ok = true;
+    while ((hr = archive_read_next_header(a, &e)) == ARCHIVE_OK || hr == ARCHIVE_WARN) {
+        if (cancelReq()) { logf_("已取消"); ok = false; break; }
+        string nm = archive_entry_pathname(e);
+        if (archive_entry_filetype(e) != AE_IFREG) continue;
+        ssize_t r;
+        while ((r = archive_read_data(a, ioBuf.data(), ioBuf.size())) > 0) { if (cancelReq()) break; }
+        if (r < 0) { logf_("驗證失敗: %s", archive_error_string(a) ? archive_error_string(a) : "資料損壞"); ok = false; break; }
+        if (nm != "Save_WebDAV_folders.txt") {
+            files++;
+            if (expectFiles > 0) { int p = pgBase + (int)((long long)files * pgSpan / expectFiles); if (p > pgPct) setPct(p); }
+        }
+    }
+    if (ok && hr != ARCHIVE_EOF) { logf_("驗證失敗: 讀取中斷"); ok = false; }
+    if (ok && files != expectFiles) { logf_("驗證失敗: 檔案數不符 (%d / %d)", files, expectFiles); ok = false; }
+    archive_read_free(a);
+    return ok;
 }
 
 static bool packAll() {
@@ -329,8 +447,8 @@ static bool packAll() {
     if (!packErr.empty()) { logf_("打包失敗: %s", packErr.c_str()); remove(TMP_FILE); return false; }
     if (packedCount == 0) { logf_("資料夾內沒有檔案，已取消"); remove(TMP_FILE); return false; }
     struct stat st;
-    if (stat(TMP_FILE, &st) != 0 || st.st_size <= 0 || !verify7z(TMP_FILE)) {
-        logf_("7z 檔案驗證失敗，已取消上傳"); remove(TMP_FILE); return false;
+    if (stat(TMP_FILE, &st) != 0 || st.st_size <= 0) {
+        logf_("7z 檔案是空的，已取消"); remove(TMP_FILE); return false;
     }
     return true;
 }
@@ -348,22 +466,29 @@ static bool safeName(const string& n) {
     return true;
 }
 
+static int skippedCount = 0, failCount = 0;
+static bool isUnder(const string& path, const string& dir) {
+    return path == dir || path.rfind(dir + "/", 0) == 0;
+}
+
 static bool unpackAll(const char* file) {
     struct archive* a = archive_read_new();
     archive_read_support_format_7zip(a);
     archive_read_support_filter_all(a);
     if (archive_read_open_filename(a, file, 1 << 16) != ARCHIVE_OK) {
-        logf_("無法開啟 7z: %s\n", archive_error_string(a)); archive_read_free(a); return false;
+        logf_("無法開啟 7z: %s", archive_error_string(a)); archive_read_free(a); return false;
     }
     struct archive_entry* e;
-    int n = 0;
-    archTotal = 0; restoredCount = 0;
+    int n = 0, hr;
+    archTotal = 0; restoredCount = 0; skippedCount = 0; failCount = 0;
     struct stat fst; long long fsz = (stat(file, &fst) == 0) ? (long long)fst.st_size : 1;
     long long b0 = -1;
-    while (archive_read_next_header(a, &e) == ARCHIVE_OK) {
+    bool cancelled = false;
+    while ((hr = archive_read_next_header(a, &e)) == ARCHIVE_OK || hr == ARCHIVE_WARN) {
+        if (cancelReq()) { cancelled = true; break; }
         if (b0 < 0) b0 = (long long)archive_filter_bytes(a, 0);
         string name = archive_entry_pathname(e);
-        if (!safeName(name)) { logf_("\n略過不安全路徑: %s\n", name.c_str()); continue; }
+        if (!safeName(name)) { logf_("略過不安全路徑: %s", name.c_str()); skippedCount++; continue; }
         if (name == "Save_WebDAV_folders.txt") {   // 清單檔: 不寫到 SD 卡，直接加入共享資料夾
             string content; ssize_t r2;
             while ((r2 = archive_read_data(a, ioBuf.data(), ioBuf.size())) > 0) content.append(ioBuf.data(), r2);
@@ -381,24 +506,40 @@ static bool unpackAll(const char* file) {
             continue;
         }
         string target = "sdmc:/" + name;
+        if (!cfg.dirs.empty()) {   // 只允許寫回共享資料夾內，避免覆蓋到其他地方
+            bool allowed = false;
+            for (auto& d : cfg.dirs) if (isUnder(target, normDir(d))) { allowed = true; break; }
+            if (!allowed) { skippedCount++; continue; }
+        }
         if (archive_entry_filetype(e) == AE_IFDIR) { mkdirs(target + "/"); mkdir(target.c_str(), 0777); continue; }
         mkdirs(target);
         FILE* f = fopen(target.c_str(), "wb");
-        if (!f) { logf_("\n無法寫入: %s\n", target.c_str()); continue; }
-        ssize_t r;
+        if (!f) { failCount++; logf_("無法寫入: %s", target.c_str()); continue; }
+        ssize_t r; bool bad = false;
         while ((r = archive_read_data(a, ioBuf.data(), ioBuf.size())) > 0) {
-            fwrite(ioBuf.data(), 1, r, f);
+            if (fwrite(ioBuf.data(), 1, r, f) != (size_t)r) { bad = true; break; }   // 寫入失敗(多半是空間不足)
             if (archTotal <= 0) {   // 舊備份沒有檔案數: 改用已讀取的資料量估算
                 long long denom = max(1LL, fsz - b0);
                 int p = pgBase + (int)(max(0LL, (long long)archive_filter_bytes(a, 0) - b0) * pgSpan / denom);
                 if (p > pgPct) setPct(p);
             }
+            if (cancelReq()) { cancelled = true; break; }
         }
+        if (!bad && !cancelled && r < 0) { bad = true; logf_("解壓錯誤: %s", archive_error_string(a) ? archive_error_string(a) : "資料損壞"); }
         fclose(f);
+        if (cancelled) break;
+        if (bad) { failCount++; logf_("寫入失敗: %s", target.c_str()); continue; }
         n++; restoredCount = n;
         if (archTotal > 0) { int p = pgBase + (int)((long long)n * pgSpan / archTotal); if (p > pgPct) setPct(p); }
     }
+    bool readErr = (!cancelled && hr != ARCHIVE_EOF);
+    if (readErr) logf_("7z 讀取中斷: %s", archive_error_string(a) ? archive_error_string(a) : "檔案可能損壞");
     archive_read_free(a);
+    if (cancelled) { logf_("已取消，部分檔案可能已經還原"); return false; }
+    if (skippedCount > 0) logf_("已略過 %d 個不在共享資料夾內的檔案", skippedCount);
+    if (failCount > 0) { logf_("有 %d 個檔案還原失敗", failCount); return false; }
+    if (readErr) return false;
+    if (n == 0) { logf_("這份備份裡沒有可還原的檔案"); return false; }
     return true;
 }
 
@@ -581,11 +722,11 @@ static bool confirm(const string& msg, const string& yes) {
 
 // ---------- 進度記錄畫面 ----------
 static deque<string> logs;
-static string logHint = "處理中，請勿關閉程式";
+static string logHint = "處理中，請勿關閉程式　按住 B 可取消";
 static const Col C_ERR = {232, 126, 92};
 
 static void pgStart(const string& title, const string& stage) {
-    pgActive = true; pgOk = false; pgErr = false; pgPct = 0; pgBase = 0; pgSpan = 100;
+    gCancel = false; pgActive = true; pgOk = false; pgErr = false; pgPct = 0; pgBase = 0; pgSpan = 100;
     pgTitle = title; pgStage = stage; pgList.clear(); logs.clear();
 }
 static void drawLog() {
@@ -644,7 +785,7 @@ static void waitDone() {
         if (ts.count > 0) touching = true; else if (touching) break;
         drawLog();
     }
-    logHint = "處理中，請勿關閉程式";
+    logHint = "處理中，請勿關閉程式　按住 B 可取消";
     pgActive = false; pgOk = false; pgErr = false;
 }
 static void finishOK(const string& msg) {   // 100% 與完成訊息同時出現
@@ -659,43 +800,128 @@ static string cleanName(string s) {
     return s;
 }
 
+// 檔名用的時間: 依 Switch 設定的時區 (台灣 = UTC+8)
+static string nowStamp() {
+    char buf[32];
+    u64 ts = 0;
+    TimeCalendarTime ct; TimeCalendarAdditionalInfo ai;
+    if (R_SUCCEEDED(timeGetCurrentTime(TimeType_UserSystemClock, &ts)) && R_SUCCEEDED(timeToCalendarTimeWithMyRule(ts, &ct, &ai))) {
+        snprintf(buf, sizeof buf, "%04u%02u%02u_%02u%02u%02u", (unsigned)ct.year, (unsigned)ct.month, (unsigned)ct.day,
+                 (unsigned)ct.hour, (unsigned)ct.minute, (unsigned)ct.second);
+    } else {
+        time_t t = time(NULL); struct tm* lt = localtime(&t);
+        strftime(buf, sizeof buf, "%Y%m%d_%H%M%S", lt);
+    }
+    return buf;
+}
+
+static long long sdFree() {   // SD 卡剩餘空間 (bytes)，-1 = 取不到
+    FsFileSystem* fs = fsdevGetDeviceFileSystem("sdmc");
+    s64 f = 0;
+    if (!fs || R_FAILED(fsFsGetFreeSpace(fs, "/", &f))) return -1;
+    return (long long)f;
+}
+
+// 還原前先把「目前的共享資料夾」備份成一份保險檔 (只留最近一份)
+static bool backupBeforeRestore() {
+    totalFiles = 0; totalBytes = 0;
+    for (auto& d : cfg.dirs) totalFiles += countFiles(normDir(d));
+    if (totalFiles == 0) return true;   // 目前沒有檔案，不需要備份
+    long long fb = sdFree();
+    if (fb >= 0 && fb < totalBytes + (64LL << 20)) { logf_("SD 卡空間不足，無法備份目前存檔"); return false; }
+    if (!packAll()) return false;
+    remove(BEFORE_FILE);
+    if (rename(TMP_FILE, BEFORE_FILE) != 0) { logf_("無法儲存備份檔"); remove(TMP_FILE); return false; }
+    return true;
+}
+
+static void doTest() {
+    gCancel = false; pgActive = false; logs.clear();
+    logf_("測試連線: %s", cfg.url.c_str());
+    if (cfg.url.empty()) { logf_("失敗: 還沒設定 WebDAV 位址"); waitDone(); return; }
+    bool ok = davExists();
+    if (!ok && (lastHttp == 404 || lastHttp == 409)) {
+        logf_("資料夾不存在，嘗試自動建立...");
+        ok = davEnsureDir();
+        if (ok) logf_("已自動建立資料夾");
+    }
+    if (!ok) { logf_("失敗: %s", describeErr().c_str()); waitDone(); return; }
+    logf_("1) 連線與帳號密碼: 成功");
+    mkdirs(string(CFG_DIR));
+    FILE* f = fopen(TEST_FILE, "wb");
+    if (f) { fputs("ok", f); fclose(f); }
+    bool w = davPut(".save_webdav_test.tmp", TEST_FILE);
+    if (w) davDel(".save_webdav_test.tmp");
+    remove(TEST_FILE);
+    if (!w) { logf_("失敗: 沒有寫入權限 (%s)", describeErr().c_str()); waitDone(); return; }
+    logf_("2) 寫入與刪除權限: 成功");
+    logf_("全部正常，可以使用!");
+    waitDone();
+}
+
 static void doUpload() {
+    gCancel = false;
     pgStart("存檔上傳", "準備中...");
     if (cfg.url.empty()) { logf_("請先設定 WebDAV 位址"); waitDone(); return; }
     if (cfg.dirs.empty()) { logf_("請先新增至少一個共享資料夾"); waitDone(); return; }
     string user = cfg.name.empty() ? "Switch" : cfg.name;
     for (size_t i = 0; i < cfg.dirs.size(); i++) pgList.push_back(to_string(i + 1) + "  " + normDir(cfg.dirs[i]));
-    pgStage = "1/2  開始打包 (掃描檔案中...)"; drawLog();
-    totalFiles = 0;
+    pgStage = "1/3  開始打包 (掃描檔案中...)"; drawLog();
+    totalFiles = 0; totalBytes = 0;
     for (auto& d : cfg.dirs) totalFiles += countFiles(normDir(d));
-    pgStage = "1/2  打包中  共 " + to_string(totalFiles) + " 個檔案"; pgBase = 0; pgSpan = 50; drawLog();
+    long long fb = sdFree(), need = totalBytes + (64LL << 20);
+    if (fb >= 0 && fb < need) {
+        char m[200];
+        snprintf(m, sizeof m, "SD 卡剩餘空間可能不夠\n剩餘約 %lld MB，預估需要約 %lld MB", fb >> 20, need >> 20);
+        if (!confirm(m, "仍要繼續")) { pgActive = false; return; }
+    }
+    pgStage = "1/3  打包中  共 " + to_string(totalFiles) + " 個檔案"; pgBase = 0; pgSpan = 40; drawLog();
     if (!packAll()) { waitDone(); return; }
 
-    time_t t = time(NULL); struct tm* lt = localtime(&t);
-    char date[16]; strftime(date, sizeof date, "%Y%m%d", lt);
-    string nm = "Save_" + user + "_" + date + ".7z";
-    struct stat st; long long kb = 0;
-    if (stat(TMP_FILE, &st) == 0) kb = (long long)st.st_size / 1024;
+    pgBase = 40; pgSpan = 10; setPct(40);
+    pgStage = "2/3  驗證 7z 檔案完整性..."; drawLog();
+    if (!verify7zFull(TMP_FILE, packedCount)) {
+        remove(TMP_FILE);
+        logf_("驗證沒通過，已取消上傳 (遠端的舊版本不受影響)");
+        waitDone(); return;
+    }
+    struct stat st; long long sz = 0;
+    if (stat(TMP_FILE, &st) == 0) sz = (long long)st.st_size;
+    string nm = "Save_" + user + "_" + nowStamp() + ".7z", tmpn = nm + ".tmp";
     pgBase = 50; pgSpan = 49; setPct(50);
-    pgStage = "2/2  上傳中  " + nm + "  (" + to_string(packedCount) + " 個檔案, " + to_string(kb) + " KB)";
+    pgStage = "3/3  上傳中  " + nm + "  (" + to_string(packedCount) + " 個檔案, " + to_string(sz / 1024) + " KB)";
     drawLog();
-    bool ok = davPut(nm, TMP_FILE);
+    bool ok = davPut(tmpn, TMP_FILE);   // 先傳成暫存檔名，傳完確認後才改成正式檔名
+    if (!ok && (lastHttp == 404 || lastHttp == 409)) {
+        logf_("WebDAV 資料夾不存在，嘗試自動建立...");
+        if (davEnsureDir()) ok = davPut(tmpn, TMP_FILE);
+    }
+    if (!ok) { logf_("上傳失敗: %s", describeErr().c_str()); davDel(tmpn); remove(TMP_FILE); waitDone(); return; }
+    long long rs = davSize(tmpn);
+    if (rs >= 0 && rs != sz) {
+        logf_("上傳後大小不符 (本機 %lld / 伺服器 %lld)，已取消", sz, rs);
+        davDel(tmpn); remove(TMP_FILE); waitDone(); return;
+    }
+    if (!davMove(tmpn, nm)) {
+        logf_("伺服器不支援改名，改為直接上傳");
+        davDel(tmpn);
+        if (!davPut(nm, TMP_FILE)) { logf_("上傳失敗: %s", describeErr().c_str()); davDel(nm); remove(TMP_FILE); waitDone(); return; }
+    }
     remove(TMP_FILE);
-    if (!ok) { waitDone(); return; }
 
-    pgStage = "2/2  整理舊版本中..."; drawLog();
+    pgStage = "3/3  整理舊版本中..."; drawLog();
     string prefix = "Save_" + user + "_";
     vector<string> names;
     if (davList(names, prefix)) {
-        names.erase(remove_if(names.begin(), names.end(), [&](const string& n) { return n.size() != prefix.size() + 11; }), names.end());
-        for (size_t i = KEEP; i < names.size(); i++)
+        names.erase(remove_if(names.begin(), names.end(), [&](const string& n) { return n.size() != prefix.size() + 18; }), names.end());
+        for (size_t i = KEEP; i < names.size(); i++)   // 只留最新 5 份，第 6 份起刪除
             logf_("刪除舊版本: %s %s", names[i].c_str(), davDel(names[i]) ? "OK" : "失敗");
     }
     finishOK("上傳完成!  " + nm);
 }
 
 static void doDownload() {
-    pgActive = false; logs.clear();
+    gCancel = false; pgActive = false; logs.clear();
     if (cfg.url.empty()) { logf_("請先設定 WebDAV 位址"); waitDone(); return; }
     logf_("讀取遠端列表...");
     vector<string> names;
@@ -705,22 +931,41 @@ static void doDownload() {
     int sel = 0;
     int r = menu("選擇要還原的版本", "A 選擇　B 返回　可觸控", rows, sel, true);
     if (r < 0) return;
-    if (!confirm("將還原:\n" + names[r] + "\n這會覆蓋 SD 卡上相同路徑的檔案!", "確定還原")) return;
-    pgStart("存檔下載覆蓋", "1/2  下載中  " + names[r]);
-    pgBase = 0; pgSpan = 40; drawLog();
-    mkdirs(string(CFG_DIR));
-    if (davGet(names[r], TMP_FILE)) {
-        pgBase = 40; pgSpan = 59; setPct(40);
-        pgStage = "2/2  解壓還原中，請勿關閉程式"; drawLog();
-        if (unpackAll(TMP_FILE)) {
-            remove(TMP_FILE);
-            finishOK("還原完成!  共 " + to_string(restoredCount) + " 個檔案");
-            return;
+    if (!confirm("將還原:\n" + names[r] + "\n這會覆蓋 SD 卡上相同路徑的檔案!\n(還原前會先自動備份目前的存檔)", "確定還原")) return;
+
+    pgStart("存檔下載覆蓋", "準備中...");
+    bool hasBackup = false;
+    if (!cfg.dirs.empty()) {
+        pgStage = "1/3  備份目前存檔 (保險用)"; pgBase = 0; pgSpan = 25; drawLog();
+        hasBackup = backupBeforeRestore();
+        if (!hasBackup) {
+            if (gCancel) { logf_("已取消"); waitDone(); return; }
+            if (!confirm("備份目前存檔失敗\n仍要繼續還原嗎?", "仍要還原")) { pgActive = false; return; }
+            gCancel = false;
         }
-        logf_("這份 7z 可能是損壞或空的(舊版上傳失敗留下的)，請改選其他版本");
     }
+    pgBase = 25; pgSpan = 25; setPct(25);
+    pgStage = "2/3  下載中  " + names[r]; drawLog();
+    mkdirs(string(CFG_DIR));
+    long long rsz = davSize(names[r]), fb = sdFree();
+    if (rsz >= 0 && fb >= 0 && fb < rsz * 3) {
+        char m[200];
+        snprintf(m, sizeof m, "SD 卡剩餘空間可能不夠\n剩餘約 %lld MB，預估需要約 %lld MB", fb >> 20, (rsz * 3) >> 20);
+        if (!confirm(m, "仍要繼續")) { pgActive = false; return; }
+    }
+    if (!davGet(names[r], TMP_FILE)) { logf_("下載失敗: %s", describeErr().c_str()); remove(TMP_FILE); waitDone(); return; }
+    struct stat st;
+    if (rsz >= 0 && stat(TMP_FILE, &st) == 0 && (long long)st.st_size != rsz) {
+        logf_("下載不完整 (%lld / %lld)", (long long)st.st_size, rsz);
+        remove(TMP_FILE); waitDone(); return;
+    }
+    pgBase = 50; pgSpan = 49; setPct(50);
+    pgStage = "3/3  解壓還原中，請勿關閉程式"; drawLog();
+    bool ok = unpackAll(TMP_FILE);
     remove(TMP_FILE);
-    waitDone();
+    if (hasBackup) logf_("還原前的存檔已備份在 SD 卡 config/Save_WebDAV/before_restore.7z");
+    if (ok) finishOK("還原完成!  共 " + to_string(restoredCount) + " 個檔案");
+    else waitDone();
 }
 
 // ---------- 資料夾選擇 ----------
@@ -988,6 +1233,7 @@ static void mainScreen() {
         L.push_back(H(R(0, "WebDAV 位址", "", cfg.url.empty() ? "(未設定)" : cfg.url), 64));
         L.push_back(H(R(0, "帳號", "", cfg.user.empty() ? "(未設定)" : cfg.user), 64));
         L.push_back(H(R(0, "密碼", "", cfg.pass.empty() ? "(未設定)" : "********"), 64));
+        L.push_back(H(R(0, "測試連線", "", "確認設定正確"), 64));
         Rr.push_back(H(R(1, "+ 新增共享資料夾"), 76));
         Rr.push_back(H(R(3, "共享資料夾 (" + to_string(cfg.dirs.size()) + ")  選擇後自動記住，點一下可移除"), 36));
         for (auto& d : cfg.dirs) Rr.push_back(H(R(5, baseName(d), d), 84));
@@ -1003,6 +1249,7 @@ static void mainScreen() {
             else if (idx == 4) { if (kbd("WebDAV 位址 (例 https://dav.example.com/ns/)", cfg.url)) saveCfg(); }
             else if (idx == 5) { if (kbd("帳號", cfg.user)) saveCfg(); }
             else if (idx == 6) { string v; if (pwEdit(v)) { cfg.pass = v; saveCfg(); } }
+            else if (idx == 7) doTest();
         } else if (idx == 0) {
             if (n >= 20) continue;
             string pth;
@@ -1020,6 +1267,7 @@ static void mainScreen() {
 
 int main(int argc, char** argv) {
     plInitialize(PlServiceType_User);
+    timeInitialize();
     if (R_FAILED(plGetSharedFontByType(&fdata, PlSharedFontType_ChineseTraditional)))
         plGetSharedFontByType(&fdata, PlSharedFontType_Standard);
     SDL_Init(SDL_INIT_VIDEO);
@@ -1044,6 +1292,7 @@ int main(int argc, char** argv) {
     SDL_DestroyRenderer(ren);
     SDL_DestroyWindow(win);
     SDL_Quit();
+    timeExit();
     plExit();
     return 0;
 }
