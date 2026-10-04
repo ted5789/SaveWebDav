@@ -24,6 +24,7 @@ static const char* CFG_FILE = "sdmc:/config/Save_WebDAV/config.txt";
 static const char* TMP_FILE = "sdmc:/config/Save_WebDAV/tmp.7z";
 static const char* BEFORE_FILE = "sdmc:/config/Save_WebDAV/before_restore.7z";
 static const char* TEST_FILE = "sdmc:/config/Save_WebDAV/test.tmp";
+static const char* LOG_FILE = "sdmc:/config/Save_WebDAV/log.txt";
 static const size_t KEEP = 5;
 
 struct Cfg { string url, user, pass, name; vector<string> dirs; } cfg;
@@ -64,6 +65,16 @@ static string normDir(string d) {
         if (!d.empty() && d[0] == '/') d = "sdmc:" + d; else d = "sdmc:/" + d;
     }
     return d;
+}
+
+// ---------- 除錯記錄 (閃退時可看停在哪一步) ----------
+static void dbg(const char* fmt, ...) {
+    static bool made = false;
+    if (!made) { mkdirs(string(CFG_DIR)); made = true; }
+    FILE* f = fopen(LOG_FILE, "a");
+    if (!f) return;
+    va_list ap; va_start(ap, fmt); vfprintf(f, fmt, ap); va_end(ap);
+    fputc('\n', f); fclose(f);
 }
 
 // ---------- 設定檔 ----------
@@ -727,7 +738,7 @@ static const Col C_ERR = {232, 126, 92};
 
 static void pgStart(const string& title, const string& stage) {
     gCancel = false; pgActive = true; pgOk = false; pgErr = false; pgPct = 0; pgBase = 0; pgSpan = 100;
-    pgTitle = title; pgStage = stage; pgList.clear(); logs.clear();
+    pgTitle = title; pgStage = stage; dbg("%s", pgStage.c_str()); pgList.clear(); logs.clear();
 }
 static void drawLog() {
     rect(0, 0, 1280, 720, C_BG);
@@ -761,6 +772,7 @@ static void setPct(int p) {   // 進行中最多顯示 99%，100% 只在全部�
 static void logf_(const char* fmt, ...) {
     char buf[1024];
     va_list ap; va_start(ap, fmt); vsnprintf(buf, sizeof buf, fmt, ap); va_end(ap);
+    dbg("%s", buf);
     string s = buf; bool repl = false;
     if (!s.empty() && s[0] == '\r') { repl = true; s.erase(0, 1); }
     size_t i = 0;
@@ -774,7 +786,7 @@ static void logf_(const char* fmt, ...) {
     drawLog();
 }
 static void waitDone() {
-    if (pgActive && !pgOk) { pgErr = true; pgStage = "未完成，請看下方訊息"; }
+    if (pgActive && !pgOk) { pgErr = true; pgStage = "未完成，請看下方訊息"; dbg("%s", pgStage.c_str()); }
     logHint = "按 A / B 或點一下螢幕返回";
     bool touching = false;
     while (appletMainLoop()) {
@@ -789,7 +801,7 @@ static void waitDone() {
     pgActive = false; pgOk = false; pgErr = false;
 }
 static void finishOK(const string& msg) {   // 100% 與完成訊息同時出現
-    pgPct = 100; pgStage = msg; pgOk = true;
+    pgPct = 100; pgStage = msg; dbg("%s", pgStage.c_str()); pgOk = true;
     drawLog();
     waitDone();
 }
@@ -866,7 +878,7 @@ static void doUpload() {
     if (cfg.dirs.empty()) { logf_("請先新增至少一個共享資料夾"); waitDone(); return; }
     string user = cfg.name.empty() ? "Switch" : cfg.name;
     for (size_t i = 0; i < cfg.dirs.size(); i++) pgList.push_back(to_string(i + 1) + "  " + normDir(cfg.dirs[i]));
-    pgStage = "1/3  開始打包 (掃描檔案中...)"; drawLog();
+    pgStage = "1/3  開始打包 (掃描檔案中...)"; dbg("%s", pgStage.c_str()); drawLog();
     totalFiles = 0; totalBytes = 0;
     for (auto& d : cfg.dirs) totalFiles += countFiles(normDir(d));
     long long fb = sdFree(), need = totalBytes + (64LL << 20);
@@ -875,11 +887,11 @@ static void doUpload() {
         snprintf(m, sizeof m, "SD 卡剩餘空間可能不夠\n剩餘約 %lld MB，預估需要約 %lld MB", fb >> 20, need >> 20);
         if (!confirm(m, "仍要繼續")) { pgActive = false; return; }
     }
-    pgStage = "1/3  打包中  共 " + to_string(totalFiles) + " 個檔案"; pgBase = 0; pgSpan = 40; drawLog();
+    pgStage = "1/3  打包中  共 " + to_string(totalFiles) + " 個檔案"; dbg("%s", pgStage.c_str()); pgBase = 0; pgSpan = 40; drawLog();
     if (!packAll()) { waitDone(); return; }
 
     pgBase = 40; pgSpan = 10; setPct(40);
-    pgStage = "2/3  驗證 7z 檔案完整性..."; drawLog();
+    pgStage = "2/3  驗證 7z 檔案完整性..."; dbg("%s", pgStage.c_str()); drawLog();
     if (!verify7zFull(TMP_FILE, packedCount)) {
         remove(TMP_FILE);
         logf_("驗證沒通過，已取消上傳 (遠端的舊版本不受影響)");
@@ -889,7 +901,7 @@ static void doUpload() {
     if (stat(TMP_FILE, &st) == 0) sz = (long long)st.st_size;
     string nm = "Save_" + user + "_" + nowStamp() + ".7z", tmpn = nm + ".tmp";
     pgBase = 50; pgSpan = 49; setPct(50);
-    pgStage = "3/3  上傳中  " + nm + "  (" + to_string(packedCount) + " 個檔案, " + to_string(sz / 1024) + " KB)";
+    pgStage = "3/3  上傳中  " + nm + "  (" + to_string(packedCount) + " 個檔案, " + to_string(sz / 1024) + " KB)"; dbg("%s", pgStage.c_str());
     drawLog();
     bool ok = davPut(tmpn, TMP_FILE);   // 先傳成暫存檔名，傳完確認後才改成正式檔名
     if (!ok && (lastHttp == 404 || lastHttp == 409)) {
@@ -909,7 +921,7 @@ static void doUpload() {
     }
     remove(TMP_FILE);
 
-    pgStage = "3/3  整理舊版本中..."; drawLog();
+    pgStage = "3/3  整理舊版本中..."; dbg("%s", pgStage.c_str()); drawLog();
     string prefix = "Save_" + user + "_";
     vector<string> names;
     if (davList(names, prefix)) {
@@ -936,7 +948,7 @@ static void doDownload() {
     pgStart("存檔下載覆蓋", "準備中...");
     bool hasBackup = false;
     if (!cfg.dirs.empty()) {
-        pgStage = "1/3  備份目前存檔 (保險用)"; pgBase = 0; pgSpan = 25; drawLog();
+        pgStage = "1/3  備份目前存檔 (保險用)"; dbg("%s", pgStage.c_str()); pgBase = 0; pgSpan = 25; drawLog();
         hasBackup = backupBeforeRestore();
         if (!hasBackup) {
             if (gCancel) { logf_("已取消"); waitDone(); return; }
@@ -945,7 +957,7 @@ static void doDownload() {
         }
     }
     pgBase = 25; pgSpan = 25; setPct(25);
-    pgStage = "2/3  下載中  " + names[r]; drawLog();
+    pgStage = "2/3  下載中  " + names[r]; dbg("%s", pgStage.c_str()); drawLog();
     mkdirs(string(CFG_DIR));
     long long rsz = davSize(names[r]), fb = sdFree();
     if (rsz >= 0 && fb >= 0 && fb < rsz * 3) {
@@ -960,7 +972,7 @@ static void doDownload() {
         remove(TMP_FILE); waitDone(); return;
     }
     pgBase = 50; pgSpan = 49; setPct(50);
-    pgStage = "3/3  解壓還原中，請勿關閉程式"; drawLog();
+    pgStage = "3/3  解壓還原中，請勿關閉程式"; dbg("%s", pgStage.c_str()); drawLog();
     bool ok = unpackAll(TMP_FILE);
     remove(TMP_FILE);
     if (hasBackup) logf_("還原前的存檔已備份在 SD 卡 config/Save_WebDAV/before_restore.7z");
@@ -1008,14 +1020,20 @@ static bool pickFolder(string& out) {
 // 自動取得 Switch 使用者暱稱
 static string getNickname() {
     string out;
-    if (R_FAILED(accountInitialize(AccountServiceType_Application))) return out;
+    // 只在「前端模式」嘗試，而且只讀系統預先選好的使用者；
+    // 不再彈出選擇使用者畫面，也不用其他可能出錯的呼叫。拿不到就留空，讓使用者自己填。
+    if (appletGetAppletType() != AppletType_Application) { dbg("nickname: skip (not application mode)"); return out; }
+    Result rc = accountInitialize(AccountServiceType_Application);
+    dbg("accountInitialize rc=0x%x", (unsigned)rc);
+    if (R_FAILED(rc)) return out;
     AccountUid uid = {};
-    bool ok = R_SUCCEEDED(accountGetPreselectedUser(&uid)) && accountUidIsValid(&uid);
-    if (!ok) ok = R_SUCCEEDED(accountGetLastOpenedUser(&uid)) && accountUidIsValid(&uid);
-    if (!ok) ok = R_SUCCEEDED(pselShowUserSelector(&uid, NULL)) && accountUidIsValid(&uid);
-    if (ok) {
+    rc = accountGetPreselectedUser(&uid);
+    dbg("accountGetPreselectedUser rc=0x%x", (unsigned)rc);
+    if (R_SUCCEEDED(rc) && accountUidIsValid(&uid)) {
         AccountProfile prof;
-        if (R_SUCCEEDED(accountGetProfile(&prof, uid))) {
+        rc = accountGetProfile(&prof, uid);
+        dbg("accountGetProfile rc=0x%x", (unsigned)rc);
+        if (R_SUCCEEDED(rc)) {
             AccountProfileBase base = {};
             AccountUserData ud = {};
             if (R_SUCCEEDED(accountProfileGet(&prof, &ud, &base))) out = base.nickname;
@@ -1024,91 +1042,6 @@ static string getNickname() {
     }
     accountExit();
     return out;
-}
-
-// ---------- 密碼輸入 (只顯示最後輸入的那一個字，其餘變 *) ----------
-static bool pwEdit(string& out) {
-    static const char* lowR[4] = {"1234567890", "qwertyuiop", "asdfghjkl-", "zxcvbnm.@_"};
-    static const char* upR[4] = {"1234567890", "QWERTYUIOP", "ASDFGHJKL-", "ZXCVBNM.@_"};
-    static const char* symR[4] = {"!@#$%^&*()", "-_=+[]{};:", "'\"\\|/<>?,.", "~`"};
-    static const char* fn[6] = {"大小寫", "符號/字母", "空白", "刪除", "完成", "取消"};
-    string val; bool reveal = false; int page = 0, cr = 1, cc = 0;
-    bool touching = false, moved = false; int sx = 0, sy = 0, lx = 0, ly = 0;
-    auto rows = [&]() -> const char** { return page == 0 ? lowR : page == 1 ? upR : symR; };
-    auto rlen = [&](int r) { return r < 4 ? (int)strlen(rows()[r]) : 6; };
-    auto geom = [&](int r, int c, int& x, int& y, int& w, int& h) {
-        h = 70; y = 230 + r * 78;
-        if (r < 4) { int n = rlen(r); w = 104; int tot = n * 104 + (n - 1) * 8; x = (1280 - tot) / 2 + c * 112; }
-        else { w = 178; x = 84 + c * 186; }
-    };
-    auto press = [&](int r, int c) -> int {
-        if (r < 4) { if ((int)val.size() < 64) { val += rows()[r][c]; reveal = true; } return 0; }
-        switch (c) {
-            case 0: page = (page == 0) ? 1 : 0; break;
-            case 1: page = (page == 2) ? 0 : 2; break;
-            case 2: val += ' '; reveal = true; break;
-            case 3: if (!val.empty()) val.pop_back(); reveal = false; break;
-            case 4: return 1;
-            case 5: return 2;
-        }
-        return 0;
-    };
-    while (appletMainLoop()) {
-        cc = min(cc, rlen(cr) - 1);
-        padUpdate(&pad);
-        u64 dn = padGetButtonsDown(&pad);
-        int res = 0;
-        if (dn & HidNpadButton_AnyUp) cr = (cr + 4) % 5;
-        if (dn & HidNpadButton_AnyDown) cr = (cr + 1) % 5;
-        cc = min(cc, rlen(cr) - 1);
-        if (dn & HidNpadButton_AnyLeft) cc = (cc + rlen(cr) - 1) % rlen(cr);
-        if (dn & HidNpadButton_AnyRight) cc = (cc + 1) % rlen(cr);
-        if (dn & HidNpadButton_A) res = press(cr, cc);
-        if (dn & HidNpadButton_B) res = press(4, 3);
-        if (dn & HidNpadButton_X) page = (page == 0) ? 1 : 0;
-        if (dn & HidNpadButton_Y) page = (page == 2) ? 0 : 2;
-        if (dn & HidNpadButton_Plus) res = 1;
-        if (dn & HidNpadButton_Minus) res = 2;
-        HidTouchScreenState ts = {0};
-        hidGetTouchScreenStates(&ts, 1);
-        if (ts.count > 0) {
-            int tx = ts.touches[0].x, ty = ts.touches[0].y;
-            if (!touching) { touching = true; moved = false; sx = tx; sy = ty; }
-            else if (abs(tx - sx) > 20 || abs(ty - sy) > 20) moved = true;
-            lx = tx; ly = ty;
-        } else if (touching) {
-            touching = false;
-            if (!moved) {
-                bool hit = false;
-                for (int r = 0; r < 5 && !hit; r++)
-                    for (int c = 0; c < rlen(r) && !hit; c++) {
-                        int x, y, w, h; geom(r, c, x, y, w, h);
-                        if (lx >= x && lx < x + w && ly >= y && ly < y + h) { cr = r; cc = c; res = press(r, c); hit = true; }
-                    }
-            }
-        }
-        if (res == 1) { out = val; return true; }
-        if (res == 2) return false;
-
-        rect(0, 0, 1280, 720, C_BG);
-        txt("新密碼 (只顯示最後輸入的字，取消則保留舊密碼)", 20, 84, 96, C_GRAY);
-        rect(84, 128, 1112, 76, C_CARD);
-        string shown;
-        for (size_t i = 0; i < val.size(); i++) shown += (i + 1 == val.size() && reveal) ? string(1, val[i]) : string("*");
-        txt(shown, 40, 104, 142, C_WHITE, 0, 1070);
-        for (int r = 0; r < 5; r++)
-            for (int c = 0; c < rlen(r); c++) {
-                int x, y, w, h; geom(r, c, x, y, w, h);
-                bool sl = (r == cr && c == cc);
-                if (sl) rect(x - 3, y - 3, w + 6, h + 6, C_ACC);
-                rect(x, y, w, h, sl ? C_SEL : C_CARD);
-                string lb = r < 4 ? string(1, rows()[r][c]) : string(fn[c]);
-                txt(lb, r < 4 ? 34 : 26, x + w / 2, y + (h - (r < 4 ? 48 : 38)) / 2, C_WHITE, 1);
-            }
-        chrome("輸入密碼", "A 輸入　B 刪除　X 大小寫　Y 符號　+ 完成　- 取消", false);
-        SDL_RenderPresent(ren);
-    }
-    return false;
 }
 
 static string baseName(const string& p) {
@@ -1266,26 +1199,47 @@ static void mainScreen() {
 }
 
 int main(int argc, char** argv) {
-    plInitialize(PlServiceType_User);
-    timeInitialize();
+    mkdirs(string(CFG_DIR));
+    { FILE* lf = fopen(LOG_FILE, "w"); if (lf) fclose(lf); }
+    dbg("start  appletType=%d", (int)appletGetAppletType());
+    {
+        u64 tot = 0, used = 0;
+        svcGetInfo(&tot, InfoType_TotalMemorySize, CUR_PROCESS_HANDLE, 0);
+        svcGetInfo(&used, InfoType_UsedMemorySize, CUR_PROCESS_HANDLE, 0);
+        dbg("memory total=%llu MB used=%llu MB", (unsigned long long)(tot >> 20), (unsigned long long)(used >> 20));
+    }
+    Result rc = plInitialize(PlServiceType_User); dbg("plInitialize rc=0x%x", (unsigned)rc);
+    rc = timeInitialize(); dbg("timeInitialize rc=0x%x", (unsigned)rc);
     if (R_FAILED(plGetSharedFontByType(&fdata, PlSharedFontType_ChineseTraditional)))
         plGetSharedFontByType(&fdata, PlSharedFontType_Standard);
-    SDL_Init(SDL_INIT_VIDEO);
-    TTF_Init();
+    dbg("font addr=%p size=%u", fdata.address, (unsigned)fdata.size);
+    if (SDL_Init(SDL_INIT_VIDEO) != 0) { dbg("SDL_Init failed: %s", SDL_GetError()); return 1; }
+    dbg("SDL_Init ok");
+    if (TTF_Init() != 0) { dbg("TTF_Init failed: %s", TTF_GetError()); return 1; }
+    dbg("TTF_Init ok");
     win = SDL_CreateWindow("Save_WebDAV", 0, 0, 1280, 720, SDL_WINDOW_SHOWN);
-    ren = SDL_CreateRenderer(win, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
+    ren = win ? SDL_CreateRenderer(win, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC) : NULL;
+    if (!win || !ren) { dbg("window/renderer failed: %s", SDL_GetError()); return 1; }
+    dbg("renderer ok");
     SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_BLEND);
     padConfigureInput(1, HidNpadStyleSet_NpadStandard);
     padInitializeDefault(&pad);
     hidInitializeTouchScreen();
-    socketInitializeDefault();
+    dbg("input ok");
+    rc = socketInitializeDefault(); dbg("socket rc=0x%x", (unsigned)rc);
     curl_global_init(CURL_GLOBAL_DEFAULT);
+    dbg("curl ok");
     loadCfg();
+    dbg("config loaded  name=[%s] dirs=%d", cfg.name.c_str(), (int)cfg.dirs.size());
     if (cfg.name.empty()) {
+        dbg("fetching nickname");
         string nk = cleanName(getNickname());
+        dbg("nickname=[%s]", nk.c_str());
         if (!nk.empty()) { cfg.name = nk; saveCfg(); }
     }
+    dbg("mainScreen start");
     mainScreen();
+    dbg("mainScreen end");
     curl_global_cleanup();
     socketExit();
     TTF_Quit();
@@ -1294,5 +1248,6 @@ int main(int argc, char** argv) {
     SDL_Quit();
     timeExit();
     plExit();
+    dbg("exit ok");
     return 0;
 }
