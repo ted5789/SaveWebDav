@@ -1044,6 +1044,91 @@ static string getNickname() {
     return out;
 }
 
+// ---------- 密碼輸入 (只顯示最後輸入的那一個字，其餘變 *) ----------
+static bool pwEdit(string& out) {
+    static const char* lowR[4] = {"1234567890", "qwertyuiop", "asdfghjkl-", "zxcvbnm.@_"};
+    static const char* upR[4] = {"1234567890", "QWERTYUIOP", "ASDFGHJKL-", "ZXCVBNM.@_"};
+    static const char* symR[4] = {"!@#$%^&*()", "-_=+[]{};:", "'\"\\|/<>?,.", "~`"};
+    static const char* fn[6] = {"大小寫", "符號/字母", "空白", "刪除", "完成", "取消"};
+    string val; bool reveal = false; int page = 0, cr = 1, cc = 0;
+    bool touching = false, moved = false; int sx = 0, sy = 0, lx = 0, ly = 0;
+    auto rows = [&]() -> const char** { return page == 0 ? lowR : page == 1 ? upR : symR; };
+    auto rlen = [&](int r) { return r < 4 ? (int)strlen(rows()[r]) : 6; };
+    auto geom = [&](int r, int c, int& x, int& y, int& w, int& h) {
+        h = 70; y = 230 + r * 78;
+        if (r < 4) { int n = rlen(r); w = 104; int tot = n * 104 + (n - 1) * 8; x = (1280 - tot) / 2 + c * 112; }
+        else { w = 178; x = 84 + c * 186; }
+    };
+    auto press = [&](int r, int c) -> int {
+        if (r < 4) { if ((int)val.size() < 64) { val += rows()[r][c]; reveal = true; } return 0; }
+        switch (c) {
+            case 0: page = (page == 0) ? 1 : 0; break;
+            case 1: page = (page == 2) ? 0 : 2; break;
+            case 2: val += ' '; reveal = true; break;
+            case 3: if (!val.empty()) val.pop_back(); reveal = false; break;
+            case 4: return 1;
+            case 5: return 2;
+        }
+        return 0;
+    };
+    while (appletMainLoop()) {
+        cc = min(cc, rlen(cr) - 1);
+        padUpdate(&pad);
+        u64 dn = padGetButtonsDown(&pad);
+        int res = 0;
+        if (dn & HidNpadButton_AnyUp) cr = (cr + 4) % 5;
+        if (dn & HidNpadButton_AnyDown) cr = (cr + 1) % 5;
+        cc = min(cc, rlen(cr) - 1);
+        if (dn & HidNpadButton_AnyLeft) cc = (cc + rlen(cr) - 1) % rlen(cr);
+        if (dn & HidNpadButton_AnyRight) cc = (cc + 1) % rlen(cr);
+        if (dn & HidNpadButton_A) res = press(cr, cc);
+        if (dn & HidNpadButton_B) res = press(4, 3);
+        if (dn & HidNpadButton_X) page = (page == 0) ? 1 : 0;
+        if (dn & HidNpadButton_Y) page = (page == 2) ? 0 : 2;
+        if (dn & HidNpadButton_Plus) res = 1;
+        if (dn & HidNpadButton_Minus) res = 2;
+        HidTouchScreenState ts = {0};
+        hidGetTouchScreenStates(&ts, 1);
+        if (ts.count > 0) {
+            int tx = ts.touches[0].x, ty = ts.touches[0].y;
+            if (!touching) { touching = true; moved = false; sx = tx; sy = ty; }
+            else if (abs(tx - sx) > 20 || abs(ty - sy) > 20) moved = true;
+            lx = tx; ly = ty;
+        } else if (touching) {
+            touching = false;
+            if (!moved) {
+                bool hit = false;
+                for (int r = 0; r < 5 && !hit; r++)
+                    for (int c = 0; c < rlen(r) && !hit; c++) {
+                        int x, y, w, h; geom(r, c, x, y, w, h);
+                        if (lx >= x && lx < x + w && ly >= y && ly < y + h) { cr = r; cc = c; res = press(r, c); hit = true; }
+                    }
+            }
+        }
+        if (res == 1) { out = val; return true; }
+        if (res == 2) return false;
+
+        rect(0, 0, 1280, 720, C_BG);
+        txt("新密碼 (只顯示最後輸入的字，取消則保留舊密碼)", 20, 84, 96, C_GRAY);
+        rect(84, 128, 1112, 76, C_CARD);
+        string shown;
+        for (size_t i = 0; i < val.size(); i++) shown += (i + 1 == val.size() && reveal) ? string(1, val[i]) : string("*");
+        txt(shown, 40, 104, 142, C_WHITE, 0, 1070);
+        for (int r = 0; r < 5; r++)
+            for (int c = 0; c < rlen(r); c++) {
+                int x, y, w, h; geom(r, c, x, y, w, h);
+                bool sl = (r == cr && c == cc);
+                if (sl) rect(x - 3, y - 3, w + 6, h + 6, C_ACC);
+                rect(x, y, w, h, sl ? C_SEL : C_CARD);
+                string lb = r < 4 ? string(1, rows()[r][c]) : string(fn[c]);
+                txt(lb, r < 4 ? 34 : 26, x + w / 2, y + (h - (r < 4 ? 48 : 38)) / 2, C_WHITE, 1);
+            }
+        chrome("輸入密碼", "A 輸入　B 刪除　X 大小寫　Y 符號　+ 完成　- 取消", false);
+        SDL_RenderPresent(ren);
+    }
+    return false;
+}
+
 static string baseName(const string& p) {
     size_t i = p.rfind('/');
     return (i == string::npos || i + 1 >= p.size()) ? p : p.substr(i + 1);
